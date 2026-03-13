@@ -1,0 +1,30 @@
+{
+  "vendor_name": "TechParts India Pvt Ltd",
+  "vendor_email": "accounts@techparts.in",
+  "invoice_number": "INV-TP-2026-120",
+  "invoice_date": "2026-03-12",
+  "due_date": "2026-04-11",
+  "po_reference": "PO-2026-101",
+  "currency": "INR",
+  "line_items": [
+    {
+      "description": "Server Rack Components",
+      "quantity": 10,
+      "unit_price": 9500.00,
+      "total": 95000.00
+    },
+    {
+      "description": "Network Cables (Cat6)",
+      "quantity": 200,
+      "unit_price": 250.00,
+      "total": 50000.00
+    }
+  ],
+  "subtotal": 145000.00,
+  "tax_rate": 18,
+  "tax_amount": 26100.00,
+  "total_amount": 171100.00,
+  "payment_terms": "Net 30",
+  "notes": "Prices updated as per revised quotation Q-2026-089",
+  "_test_scenario": "AMOUNT_MISMATCH — Invoice total ₹145,000 exceeds PO total ₹125,000 by 16%. Should be FLAGGED."
+}
