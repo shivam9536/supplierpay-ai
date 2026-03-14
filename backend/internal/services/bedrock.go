@@ -75,52 +75,68 @@ func buildBedrockRuntime(cfg *config.Config, logger *zap.Logger) *bedrockruntime
 	return bedrockruntime.NewFromConfig(awsCfg)
 }
 
-// ── Claude message types ─────────────────────
+// ── Amazon Nova message types ─────────────────────
 
-type claudeMessage struct {
-	Role    string         `json:"role"`
-	Content []claudeBlock  `json:"content"`
+type novaMessage struct {
+	Role    string      `json:"role"`
+	Content []novaBlock `json:"content"`
 }
 
-type claudeBlock struct {
-	Type   string `json:"type"`
-	Text   string `json:"text,omitempty"`
-	Source *claudeImageSource `json:"source,omitempty"`
+type novaBlock struct {
+	Text  string          `json:"text,omitempty"`
+	Image *novaImageBlock `json:"image,omitempty"`
 }
 
-type claudeImageSource struct {
-	Type      string `json:"type"`
-	MediaType string `json:"media_type"`
-	Data      string `json:"data"`
+type novaImageBlock struct {
+	Format string          `json:"format"`
+	Source novaImageSource `json:"source"`
 }
 
-type claudeRequest struct {
-	AnthropicVersion string          `json:"anthropic_version"`
-	MaxTokens        int             `json:"max_tokens"`
-	Messages         []claudeMessage `json:"messages"`
-	System           string          `json:"system,omitempty"`
+type novaImageSource struct {
+	Bytes string `json:"bytes"`
 }
 
-type claudeResponse struct {
-	Content []struct {
-		Type string `json:"type"`
-		Text string `json:"text"`
-	} `json:"content"`
-	StopReason string `json:"stop_reason"`
+type novaRequest struct {
+	SchemaVersion   string           `json:"schemaVersion"`
+	Messages        []novaMessage    `json:"messages"`
+	System          []novaBlock      `json:"system,omitempty"`
+	InferenceConfig *novaInferConfig `json:"inferenceConfig,omitempty"`
+}
+
+type novaInferConfig struct {
+	MaxTokens   int     `json:"maxTokens,omitempty"`
+	Temperature float64 `json:"temperature,omitempty"`
+	TopP        float64 `json:"topP,omitempty"`
+}
+
+type novaResponse struct {
+	Output struct {
+		Message struct {
+			Role    string `json:"role"`
+			Content []struct {
+				Text string `json:"text"`
+			} `json:"content"`
+		} `json:"message"`
+	} `json:"output"`
+	StopReason string `json:"stopReason"`
 	Usage      struct {
-		InputTokens  int `json:"input_tokens"`
-		OutputTokens int `json:"output_tokens"`
+		InputTokens  int `json:"inputTokens"`
+		OutputTokens int `json:"outputTokens"`
 	} `json:"usage"`
 }
 
 // invokeModel calls Bedrock InvokeModel and returns the text response.
 func (b *BedrockClient) invokeModel(ctx context.Context, system, userText string) (string, error) {
-	req := claudeRequest{
-		AnthropicVersion: "bedrock-2023-05-31",
-		MaxTokens:        b.cfg.BedrockMaxTokens,
-		System:           system,
-		Messages: []claudeMessage{
-			{Role: "user", Content: []claudeBlock{{Type: "text", Text: userText}}},
+	req := novaRequest{
+		SchemaVersion: "messages-v1",
+		System:        []novaBlock{{Text: system}},
+		Messages: []novaMessage{
+			{Role: "user", Content: []novaBlock{{Text: userText}}},
+		},
+		InferenceConfig: &novaInferConfig{
+			MaxTokens:   b.cfg.BedrockMaxTokens,
+			Temperature: 0.7,
+			TopP:        0.9,
 		},
 	}
 	body, err := json.Marshal(req)
@@ -138,11 +154,11 @@ func (b *BedrockClient) invokeModel(ctx context.Context, system, userText string
 		return "", fmt.Errorf("bedrock invoke: %w", err)
 	}
 
-	var resp claudeResponse
+	var resp novaResponse
 	if err := json.Unmarshal(out.Body, &resp); err != nil {
 		return "", fmt.Errorf("unmarshal response: %w", err)
 	}
-	if len(resp.Content) == 0 {
+	if len(resp.Output.Message.Content) == 0 {
 		return "", fmt.Errorf("empty response from Bedrock")
 	}
 	b.logger.Info("Bedrock invoked",
@@ -150,36 +166,54 @@ func (b *BedrockClient) invokeModel(ctx context.Context, system, userText string
 		zap.Int("input_tokens", resp.Usage.InputTokens),
 		zap.Int("output_tokens", resp.Usage.OutputTokens),
 	)
-	return resp.Content[0].Text, nil
+	return resp.Output.Message.Content[0].Text, nil
 }
 
 // invokeModelWithImage calls Bedrock with an image payload (for PDF/image invoices).
 func (b *BedrockClient) invokeModelWithImage(ctx context.Context, system, userText string, imageData []byte, mimeType string) (string, error) {
-	mediaType := mimeType
-	if mediaType == "application/pdf" {
-		// Claude vision doesn't support PDF natively; send as base64 text prompt
+	// For PDF, send as base64 text prompt since Nova doesn't support PDF directly
+	if mimeType == "application/pdf" {
 		return b.invokeModel(ctx, system, userText+"\n\n[Invoice data (base64-encoded PDF)]: "+base64.StdEncoding.EncodeToString(imageData))
 	}
 
-	req := claudeRequest{
-		AnthropicVersion: "bedrock-2023-05-31",
-		MaxTokens:        b.cfg.BedrockMaxTokens,
-		System:           system,
-		Messages: []claudeMessage{
+	// Determine image format for Nova
+	var format string
+	switch mimeType {
+	case "image/jpeg":
+		format = "jpeg"
+	case "image/png":
+		format = "png"
+	case "image/gif":
+		format = "gif"
+	case "image/webp":
+		format = "webp"
+	default:
+		format = "jpeg"
+	}
+
+	req := novaRequest{
+		SchemaVersion: "messages-v1",
+		System:        []novaBlock{{Text: system}},
+		Messages: []novaMessage{
 			{
 				Role: "user",
-				Content: []claudeBlock{
+				Content: []novaBlock{
 					{
-						Type: "image",
-						Source: &claudeImageSource{
-							Type:      "base64",
-							MediaType: mediaType,
-							Data:      base64.StdEncoding.EncodeToString(imageData),
+						Image: &novaImageBlock{
+							Format: format,
+							Source: novaImageSource{
+								Bytes: base64.StdEncoding.EncodeToString(imageData),
+							},
 						},
 					},
-					{Type: "text", Text: userText},
+					{Text: userText},
 				},
 			},
+		},
+		InferenceConfig: &novaInferConfig{
+			MaxTokens:   b.cfg.BedrockMaxTokens,
+			Temperature: 0.7,
+			TopP:        0.9,
 		},
 	}
 	body, err := json.Marshal(req)
@@ -197,14 +231,14 @@ func (b *BedrockClient) invokeModelWithImage(ctx context.Context, system, userTe
 		return "", fmt.Errorf("bedrock invoke: %w", err)
 	}
 
-	var resp claudeResponse
+	var resp novaResponse
 	if err := json.Unmarshal(out.Body, &resp); err != nil {
 		return "", fmt.Errorf("unmarshal response: %w", err)
 	}
-	if len(resp.Content) == 0 {
+	if len(resp.Output.Message.Content) == 0 {
 		return "", fmt.Errorf("empty response from Bedrock")
 	}
-	return resp.Content[0].Text, nil
+	return resp.Output.Message.Content[0].Text, nil
 }
 
 // ── LLMService implementation ────────────────
@@ -373,12 +407,12 @@ Return ONLY this JSON:
 
 // LLMValidationResult holds the structured output from the LLM validation pass.
 type LLMValidationResult struct {
-	OverallAssessment       string                   `json:"overall_assessment"`
-	Confidence              float64                  `json:"confidence"`
-	AdditionalDiscrepancies []string                 `json:"additional_discrepancies"`
-	SemanticMatches         []SemanticMatch          `json:"semantic_matches"`
-	RiskFlags               []string                 `json:"risk_flags"`
-	Explanation             string                   `json:"explanation"`
+	OverallAssessment       string          `json:"overall_assessment"`
+	Confidence              float64         `json:"confidence"`
+	AdditionalDiscrepancies []string        `json:"additional_discrepancies"`
+	SemanticMatches         []SemanticMatch `json:"semantic_matches"`
+	RiskFlags               []string        `json:"risk_flags"`
+	Explanation             string          `json:"explanation"`
 }
 
 type SemanticMatch struct {
