@@ -468,7 +468,7 @@ func (o *Orchestrator) runValidation(
 		}
 	}
 
-	// ── Determine final status ───────────────────────────────────────────
+	// ── Determine rule-based status ──────────────────────────────────────
 	hasFail := false
 	hasSoft := false
 	for _, c := range rec.CheckResults {
@@ -480,6 +480,45 @@ func (o *Orchestrator) runValidation(
 				hasFail = true
 			}
 		}
+	}
+
+	// ── LLM semantic validation pass ─────────────────────────────────────
+	// Build a PO details map for the LLM from what we've already fetched.
+	poDetailsForLLM := map[string]interface{}{
+		"po_number":       poRef,
+		"total_value":     poTotal,
+		"remaining_value": poRemaining,
+		"status":          poStatus,
+		"line_items":      poLineItemsJSON,
+	}
+	ruleCheckSummary := fmt.Sprintf("Rule checks: hasFail=%v hasSoft=%v failures=%v", hasFail, hasSoft, rec.FailureReasons)
+
+	llmResult, llmErr := o.bedrock.ValidateWithLLM(ctx, fields, poDetailsForLLM, ruleCheckSummary)
+	if llmErr != nil {
+		o.logger.Warn("LLM validation failed, proceeding with rule-based result only", zap.Error(llmErr))
+	} else {
+		o.logger.Info("LLM validation complete",
+			zap.String("assessment", llmResult.OverallAssessment),
+			zap.Float64("confidence", llmResult.Confidence),
+			zap.Strings("risk_flags", llmResult.RiskFlags),
+		)
+		// Merge LLM findings into check results
+		for _, disc := range llmResult.AdditionalDiscrepancies {
+			addCheck("llm_discrepancy", false, "LLM: "+disc)
+			hasSoft = true
+		}
+		for _, flag := range llmResult.RiskFlags {
+			addCheck("llm_risk_flag", false, "LLM risk: "+flag)
+			hasSoft = true
+		}
+		// If LLM says REJECT, escalate to hard fail
+		if llmResult.OverallAssessment == "REJECT" && !hasFail {
+			hasFail = true
+			rec.FailureReasons = append(rec.FailureReasons, "LLM audit: "+llmResult.Explanation)
+		}
+		// Store LLM explanation in check results
+		addCheck("llm_audit", llmResult.OverallAssessment != "REJECT",
+			fmt.Sprintf("LLM audit (%s, confidence=%.2f): %s", llmResult.OverallAssessment, llmResult.Confidence, llmResult.Explanation))
 	}
 
 	finishedAt := time.Now()

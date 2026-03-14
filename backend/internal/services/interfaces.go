@@ -13,6 +13,9 @@ type LLMService interface {
 
 	// ExplainDecision generates a human-readable explanation of the agent's decision
 	ExplainDecision(ctx context.Context, matchResult map[string]interface{}) (string, error)
+
+	// ValidateWithLLM performs a semantic LLM-powered validation pass on the invoice
+	ValidateWithLLM(ctx context.Context, invoiceFields map[string]interface{}, poDetails map[string]interface{}, ruleCheckSummary string) (*LLMValidationResult, error)
 }
 
 // ── Storage Service Interface ───────────────

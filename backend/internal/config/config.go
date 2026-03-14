@@ -24,8 +24,9 @@ type Config struct {
 	AWSRegion string
 
 	// Bedrock
-	BedrockModelID   string
-	BedrockMaxTokens int
+	BedrockModelID      string
+	BedrockMaxTokens    int
+	BedrockBearerToken  string
 
 	// S3
 	S3BucketName string
@@ -61,8 +62,9 @@ func Load() *Config {
 
 		AWSRegion: getEnv("AWS_REGION", "ap-south-1"),
 
-		BedrockModelID:   getEnv("BEDROCK_MODEL_ID", "anthropic.claude-3-5-sonnet-20241022-v2:0"),
-		BedrockMaxTokens: getEnvInt("BEDROCK_MAX_TOKENS", 4096),
+		BedrockModelID:     getEnv("BEDROCK_MODEL_ID", "anthropic.claude-3-5-sonnet-20241022-v2:0"),
+		BedrockMaxTokens:   getEnvInt("BEDROCK_MAX_TOKENS", 4096),
+		BedrockBearerToken: getEnv("AWS_BEARER_TOKEN_BEDROCK", ""),
 
 		S3BucketName: getEnv("S3_BUCKET_NAME", "supplierpay-invoices"),
 		S3Region:     getEnv("S3_REGION", "ap-south-1"),

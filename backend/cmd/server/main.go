@@ -16,8 +16,10 @@ import (
 )
 
 func main() {
-	// Load .env file (ignore error in production where env vars are set directly)
-	_ = godotenv.Load()
+	// Load env file — try .env first, fall back to .env.example for local dev
+	if err := godotenv.Load(".env"); err != nil {
+		_ = godotenv.Load(".env.example")
+	}
 
 	// Initialize logger
 	logger, err := zap.NewDevelopment()
