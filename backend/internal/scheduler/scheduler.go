@@ -2,6 +2,7 @@ package scheduler
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"time"
 
@@ -10,16 +11,18 @@ import (
 	"github.com/robfig/cron/v3"
 	"github.com/supplierpay/backend/internal/agent"
 	"github.com/supplierpay/backend/internal/config"
+	"github.com/supplierpay/backend/internal/services"
 	"go.uber.org/zap"
 )
 
 // PaymentScheduler runs nightly payment jobs and polls for pending invoices.
 type PaymentScheduler struct {
-	db     *sqlx.DB
-	cfg    *config.Config
-	logger *zap.Logger
-	orch   *agent.Orchestrator
-	cron   *cron.Cron
+	db      *sqlx.DB
+	cfg     *config.Config
+	logger  *zap.Logger
+	orch    *agent.Orchestrator
+	payment services.PaymentService
+	cron    *cron.Cron
 
 	// invoice-poll state
 	pollStop chan struct{}
@@ -30,12 +33,13 @@ type PaymentScheduler struct {
 	inFlightMu sync.Mutex
 }
 
-func NewPaymentScheduler(db *sqlx.DB, cfg *config.Config, logger *zap.Logger, orch *agent.Orchestrator) *PaymentScheduler {
+func NewPaymentScheduler(db *sqlx.DB, cfg *config.Config, logger *zap.Logger, orch *agent.Orchestrator, payment services.PaymentService) *PaymentScheduler {
 	return &PaymentScheduler{
 		db:       db,
 		cfg:      cfg,
 		logger:   logger,
 		orch:     orch,
+		payment:  payment,
 		cron:     cron.New(),
 		pollStop: make(chan struct{}),
 		inFlight: make(map[uuid.UUID]struct{}),
@@ -91,25 +95,16 @@ func (s *PaymentScheduler) pollPendingInvoices() {
 	}
 }
 
-// stallRecoveryTimeout is how long an invoice can remain in a transient
-// processing state (EXTRACTING / VALIDATING) before it is considered stalled
-// and eligible for re-processing.
-const stallRecoveryTimeout = 2 * time.Minute
-
 // pickAndProcessPendingInvoice fetches the oldest PENDING invoice (one at a
 // time, FIFO by created_at) and dispatches it to the agent pipeline.
-// It also recovers invoices that got stuck in EXTRACTING or VALIDATING states
-// (e.g. due to a server crash) for longer than stallRecoveryTimeout.
 // Using SELECT … FOR UPDATE SKIP LOCKED ensures safe concurrent execution if
 // multiple scheduler instances ever run side-by-side.
 func (s *PaymentScheduler) pickAndProcessPendingInvoice() {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	// Atomically claim one invoice that is either:
-	//   a) PENDING (normal path), or
-	//   b) stuck in EXTRACTING / VALIDATING for > stallRecoveryTimeout (crash recovery)
-	// Reset it to PENDING so the full pipeline runs from the beginning.
+	// Atomically claim exactly one PENDING invoice and transition it to
+	// EXTRACTING so no other poller picks it up.
 	var invoiceID uuid.UUID
 	err := s.db.QueryRowContext(ctx, `
 		UPDATE invoices
@@ -117,14 +112,12 @@ func (s *PaymentScheduler) pickAndProcessPendingInvoice() {
 		 WHERE id = (
 		       SELECT id FROM invoices
 		        WHERE status = 'PENDING'
-		           OR (status IN ('EXTRACTING', 'VALIDATING')
-		               AND updated_at < NOW() - $1::interval)
 		        ORDER BY created_at ASC
 		        LIMIT 1
 		        FOR UPDATE SKIP LOCKED
 		 )
 		RETURNING id
-	`, stallRecoveryTimeout.String()).Scan(&invoiceID)
+	`).Scan(&invoiceID)
 
 	if err != nil {
 		// No rows → nothing to do; any other error is transient, log and move on.
@@ -166,16 +159,154 @@ func (s *PaymentScheduler) pickAndProcessPendingInvoice() {
 
 // ── Nightly / periodic jobs ───────────────────────────────────────────────
 
+// scheduledInvoice holds the minimal fields needed for a payment run.
+type scheduledInvoice struct {
+	ID            uuid.UUID `db:"id"`
+	InvoiceNumber *string   `db:"invoice_number"`
+	TotalAmount   float64   `db:"total_amount"`
+	Currency      *string   `db:"currency"`
+	VendorName    string    `db:"vendor_name"`
+	AccountNumber string    `db:"bank_account_number"`
+	IFSC          string    `db:"bank_ifsc"`
+}
+
 func (s *PaymentScheduler) runPayments() {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+
 	s.logger.Info("Running nightly payment batch")
 
-	// TODO: Dev 1 — Implement payment run
-	// 1. SELECT * FROM invoices WHERE scheduled_payment_date = CURRENT_DATE AND status = 'SCHEDULED'
-	// 2. Group by vendor for batch processing
-	// 3. Call Pine Labs disbursement API for each batch
-	// 4. Update invoice statuses
-	// 5. Create PaymentRun record
-	// 6. Handle failures with retry logic
+	// 1. Fetch all SCHEDULED invoices due today
+	var invoices []scheduledInvoice
+	err := s.db.SelectContext(ctx, &invoices, `
+		SELECT i.id,
+		       i.invoice_number,
+		       i.total_amount,
+		       i.currency,
+		       v.name            AS vendor_name,
+		       v.bank_account_number,
+		       v.bank_ifsc
+		  FROM invoices i
+		  JOIN vendors v ON i.vendor_id = v.id
+		 WHERE i.status = 'SCHEDULED'
+		   AND i.scheduled_payment_date <= CURRENT_DATE
+		   AND i.pinelabs_transaction_id IS NULL
+		 ORDER BY i.scheduled_payment_date ASC
+	`)
+	if err != nil {
+		s.logger.Error("Failed to fetch scheduled invoices", zap.Error(err))
+		return
+	}
+	if len(invoices) == 0 {
+		s.logger.Info("No invoices due for payment today")
+		return
+	}
+
+	s.logger.Info("Payment batch: invoices to process", zap.Int("count", len(invoices)))
+
+	// 2. Create a PaymentRun record
+	runID := uuid.New()
+	totalAmount := 0.0
+	for _, inv := range invoices {
+		totalAmount += inv.TotalAmount
+	}
+
+	_, err = s.db.ExecContext(ctx, `
+		INSERT INTO payment_runs (id, run_date, total_amount, invoice_count, status)
+		VALUES ($1, CURRENT_DATE, $2, $3, 'EXECUTING')`,
+		runID, totalAmount, len(invoices),
+	)
+	if err != nil {
+		s.logger.Error("Failed to create payment run record", zap.Error(err))
+		return
+	}
+
+	// 3. Disburse each invoice via Pine Labs
+	successCount := 0
+	failCount := 0
+
+	for _, inv := range invoices {
+		invNum := ""
+		if inv.InvoiceNumber != nil {
+			invNum = *inv.InvoiceNumber
+		}
+		currency := "INR"
+		if inv.Currency != nil && *inv.Currency != "" {
+			currency = *inv.Currency
+		}
+
+		ref := fmt.Sprintf("SUPPAY-%s", inv.ID.String()[:8])
+		disbResp, disbErr := s.payment.InitiateDisbursement(ctx, services.DisbursementRequest{
+			InvoiceID:     inv.ID.String(),
+			VendorName:    inv.VendorName,
+			AccountNumber: inv.AccountNumber,
+			IFSC:          inv.IFSC,
+			Amount:        inv.TotalAmount,
+			Currency:      currency,
+			Reference:     ref,
+		})
+
+		if disbErr != nil {
+			s.logger.Error("Disbursement failed",
+				zap.String("invoice_id", inv.ID.String()),
+				zap.String("invoice_number", invNum),
+				zap.Error(disbErr),
+			)
+			failCount++
+			// Mark invoice with a failure note but keep status SCHEDULED for retry
+			_, _ = s.db.ExecContext(ctx,
+				`UPDATE invoices SET decision_reason = $1, updated_at = NOW() WHERE id = $2`,
+				fmt.Sprintf("Disbursement failed: %v", disbErr), inv.ID,
+			)
+			continue
+		}
+
+		// 4. Update invoice: store transaction ID and mark PAID
+		_, updateErr := s.db.ExecContext(ctx, `
+			UPDATE invoices
+			   SET status = 'PAID',
+			       pinelabs_transaction_id = $1,
+			       updated_at = NOW()
+			 WHERE id = $2`,
+			disbResp.TransactionID, inv.ID,
+		)
+		if updateErr != nil {
+			s.logger.Error("Failed to update invoice after disbursement",
+				zap.String("invoice_id", inv.ID.String()),
+				zap.Error(updateErr),
+			)
+		} else {
+			s.logger.Info("Invoice paid",
+				zap.String("invoice_id", inv.ID.String()),
+				zap.String("invoice_number", invNum),
+				zap.String("transaction_id", disbResp.TransactionID),
+				zap.Float64("amount", inv.TotalAmount),
+			)
+			successCount++
+		}
+	}
+
+	// 5. Update PaymentRun with final status
+	runStatus := "COMPLETED"
+	if failCount > 0 && successCount == 0 {
+		runStatus = "PARTIAL_FAILURE"
+	} else if failCount > 0 {
+		runStatus = "PARTIAL_FAILURE"
+	}
+
+	_, _ = s.db.ExecContext(ctx, `
+		UPDATE payment_runs
+		   SET status = $1, updated_at = NOW()
+		 WHERE id = $2`,
+		runStatus, runID,
+	)
+
+	s.logger.Info("Payment batch complete",
+		zap.String("run_id", runID.String()),
+		zap.Int("success", successCount),
+		zap.Int("failed", failCount),
+		zap.String("status", runStatus),
+	)
 }
 
 func (s *PaymentScheduler) updateForecast() {

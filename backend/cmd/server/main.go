@@ -49,31 +49,34 @@ func main() {
 	var llm services.LLMService
 	var storage services.StorageService
 	var email services.EmailService
+	var payment services.PaymentService
 	if cfg.MockMode {
 		llm = services.NewMockLLMClient(logger)
 		storage = services.NewMockStorageClient(logger)
 		email = services.NewMockEmailClient(logger)
+		payment = services.NewMockPaymentClient(logger)
 	} else {
 		llm = services.NewBedrockClient(cfg, logger)
 		storage = services.NewS3Client(cfg, logger)
 		email = services.NewSESClient(cfg, logger)
+		payment = services.NewPineLabsClient(cfg, logger)
 	}
 
 	// Agent orchestrator and event broadcaster
-	orch := agent.NewOrchestrator(db, cfg, logger, llm, storage, email)
+	orch := agent.NewOrchestrator(db, cfg, logger, llm, storage, email, payment)
 	broadcaster := events.NewBroadcaster(orch.GetEventChannel())
 	broadcaster.Start()
 	defer broadcaster.Stop()
 	logger.Info("Agent orchestrator and event broadcaster started")
 
 	// Start payment scheduler (cron) + invoice poll loop
-	cron := scheduler.NewPaymentScheduler(db, cfg, logger, orch)
+	cron := scheduler.NewPaymentScheduler(db, cfg, logger, orch, payment)
 	cron.Start()
 	defer cron.Stop()
 	logger.Info("Payment scheduler started")
 
 	// Setup and start HTTP server
-	r := router.Setup(db, cfg, logger, orch, broadcaster, storage)
+	r := router.Setup(db, cfg, logger, orch, broadcaster, storage, payment)
 
 	port := cfg.AppPort
 	if port == "" {

@@ -47,7 +47,7 @@ CREATE TABLE IF NOT EXISTS goods_receipts (
 -- ── Invoices ────────────────────────────────
 CREATE TABLE IF NOT EXISTS invoices (
     id                        UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    vendor_id                 UUID NOT NULL REFERENCES vendors(id),
+    vendor_id                 UUID REFERENCES vendors(id),
     invoice_number            VARCHAR(100),
     po_reference              VARCHAR(50),
     raw_file_url              TEXT,

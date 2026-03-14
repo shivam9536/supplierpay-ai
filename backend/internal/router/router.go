@@ -13,7 +13,7 @@ import (
 	"go.uber.org/zap"
 )
 
-func Setup(db *sqlx.DB, cfg *config.Config, logger *zap.Logger, orch *agent.Orchestrator, broadcaster *events.Broadcaster, storage services.StorageService) *gin.Engine {
+func Setup(db *sqlx.DB, cfg *config.Config, logger *zap.Logger, orch *agent.Orchestrator, broadcaster *events.Broadcaster, storage services.StorageService, payment services.PaymentService) *gin.Engine {
 	if cfg.AppEnv == "production" {
 		gin.SetMode(gin.ReleaseMode)
 	}
@@ -37,7 +37,7 @@ func Setup(db *sqlx.DB, cfg *config.Config, logger *zap.Logger, orch *agent.Orch
 	invoiceHandler := handlers.NewInvoiceHandler(db, cfg, logger, orch, storage)
 	vendorHandler := handlers.NewVendorHandler(db, logger)
 	poHandler := handlers.NewPurchaseOrderHandler(db, logger)
-	paymentHandler := handlers.NewPaymentHandler(db, cfg, logger)
+	paymentHandler := handlers.NewPaymentHandler(db, cfg, logger, payment)
 	forecastHandler := handlers.NewForecastHandler(db, logger)
 	sseHandler := handlers.NewSSEHandler(logger, broadcaster)
 

@@ -1,10 +1,13 @@
 import { useState } from 'react'
+import { useNavigate } from 'react-router-dom'
 import { Upload, FileText, Loader2 } from 'lucide-react'
+import { uploadInvoice } from '../services/api'
 
 export default function UploadInvoice() {
+  const navigate = useNavigate()
   const [file, setFile] = useState(null)
   const [uploading, setUploading] = useState(false)
-  const [result, setResult] = useState(null)
+  const [error, setError] = useState('')
   const [dragOver, setDragOver] = useState(false)
 
   const handleDrop = (e) => {
@@ -17,17 +20,17 @@ export default function UploadInvoice() {
   const handleUpload = async () => {
     if (!file) return
     setUploading(true)
+    setError('')
 
-    // TODO: Dev 4 — Call uploadInvoice() API with FormData
-    // Then subscribe to SSE for real-time pipeline updates
-    setTimeout(() => {
-      setResult({
-        invoice_id: 'new-invoice-id',
-        status: 'PENDING',
-        message: 'Invoice uploaded and processing started',
-      })
+    try {
+      const formData = new FormData()
+      formData.append('invoice', file)
+      await uploadInvoice(formData)
+      navigate('/invoices')
+    } catch (err) {
+      setError(err.response?.data?.error || err.response?.data?.message || 'Upload failed. Please try again.')
       setUploading(false)
-    }, 1500)
+    }
   }
 
   return (
@@ -41,6 +44,7 @@ export default function UploadInvoice() {
         {/* PDF Upload */}
         <div className="bg-white rounded-xl border border-gray-200 shadow-sm p-6">
           <h2 className="text-lg font-semibold text-gray-900 mb-4">PDF Upload</h2>
+
           <div
             onDragOver={(e) => { e.preventDefault(); setDragOver(true) }}
             onDragLeave={() => setDragOver(false)}
@@ -83,10 +87,9 @@ export default function UploadInvoice() {
             </div>
           )}
 
-          {result && (
-            <div className="mt-4 p-4 bg-green-50 border border-green-200 rounded-lg">
-              <p className="text-sm font-medium text-green-800">{result.message}</p>
-              <p className="text-xs text-green-600 mt-1">Invoice ID: {result.invoice_id}</p>
+          {error && (
+            <div className="mt-4 p-4 bg-red-50 border border-red-200 rounded-lg">
+              <p className="text-sm font-medium text-red-800">{error}</p>
             </div>
           )}
         </div>

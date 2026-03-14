@@ -40,18 +40,16 @@ func (h *InvoiceHandler) Upload(c *gin.Context) {
 		return
 	}
 	vendorIDStr := c.PostForm("vendor_id")
-	if vendorIDStr == "" {
-		c.JSON(http.StatusBadRequest, models.APIResponse{
-			Success: false, Error: "vendor_id is required",
-		})
-		return
-	}
-	vendorID, err := uuid.Parse(vendorIDStr)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, models.APIResponse{
-			Success: false, Error: "Invalid vendor_id",
-		})
-		return
+	var vendorID *uuid.UUID
+	if vendorIDStr != "" {
+		parsed, err := uuid.Parse(vendorIDStr)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, models.APIResponse{
+				Success: false, Error: "Invalid vendor_id",
+			})
+			return
+		}
+		vendorID = &parsed
 	}
 	poReference := c.PostForm("po_reference")
 
@@ -88,6 +86,7 @@ func (h *InvoiceHandler) Upload(c *gin.Context) {
 	_, err = h.db.Exec(`INSERT INTO invoices (id, vendor_id, invoice_number, po_reference, raw_file_url, status)
 		VALUES ($1, $2, $3, $4, $5, $6)`,
 		invoiceID, vendorID, "", poReference, rawURL, models.InvoiceStatusPending)
+
 	if err != nil {
 		h.logger.Error("Failed to create invoice record", zap.Error(err))
 		c.JSON(http.StatusInternalServerError, models.APIResponse{

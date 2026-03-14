@@ -72,21 +72,21 @@ func (r RawJSON) Value() (driver.Value, error) {
 // ── Invoice ─────────────────────────────────
 type Invoice struct {
 	ID                    uuid.UUID     `db:"id" json:"id"`
-	VendorID              uuid.UUID     `db:"vendor_id" json:"vendor_id"`
-	InvoiceNumber         string        `db:"invoice_number" json:"invoice_number"`
-	POReference           string        `db:"po_reference" json:"po_reference"`
+	VendorID              *uuid.UUID    `db:"vendor_id" json:"vendor_id,omitempty"`
+	InvoiceNumber         *string       `db:"invoice_number" json:"invoice_number,omitempty"`
+	POReference           *string       `db:"po_reference" json:"po_reference,omitempty"`
 	RawFileURL            *string       `db:"raw_file_url" json:"raw_file_url,omitempty"`
 	ExtractedFields       JSONB         `db:"extracted_fields" json:"extracted_fields"`
 	LineItems             RawJSON       `db:"line_items" json:"line_items"`
 	TotalAmount           float64       `db:"total_amount" json:"total_amount"`
 	TaxAmount             float64       `db:"tax_amount" json:"tax_amount"`
-	Currency              string        `db:"currency" json:"currency"`
+	Currency              *string       `db:"currency" json:"currency,omitempty"`
 	InvoiceDate           *time.Time    `db:"invoice_date" json:"invoice_date,omitempty"`
 	DueDate               *time.Time    `db:"due_date" json:"due_date,omitempty"`
 	Status                InvoiceStatus `db:"status" json:"status"`
 	Discrepancies         RawJSON       `db:"discrepancies" json:"discrepancies"`
-	DecisionReason        string        `db:"decision_reason" json:"decision_reason"`
-	ScheduledPaymentDate  *time.Time    `db:"scheduled_payment_date" json:"scheduled_payment_date"`
+	DecisionReason        *string       `db:"decision_reason" json:"decision_reason,omitempty"`
+	ScheduledPaymentDate  *time.Time    `db:"scheduled_payment_date" json:"scheduled_payment_date,omitempty"`
 	PineLabsTransactionID *string       `db:"pinelabs_transaction_id" json:"pinelabs_transaction_id,omitempty"`
 	CreatedAt             time.Time     `db:"created_at" json:"created_at"`
 	UpdatedAt             time.Time     `db:"updated_at" json:"updated_at"`
@@ -95,7 +95,7 @@ type Invoice struct {
 // InvoiceWithVendor is used for list responses with vendor name joined.
 type InvoiceWithVendor struct {
 	Invoice
-	VendorName string `db:"vendor_name" json:"vendor_name"`
+	VendorName *string `db:"vendor_name" json:"vendor_name,omitempty"`
 }
 
 // ── Invoice Create Request ──────────────────

@@ -34,6 +34,7 @@ type Orchestrator struct {
 	bedrock   services.LLMService
 	s3        services.StorageService
 	ses       services.EmailService
+	payment   services.PaymentService
 	eventChan chan models.SSEEvent // For real-time updates
 }
 
@@ -44,6 +45,7 @@ func NewOrchestrator(
 	bedrock services.LLMService,
 	s3 services.StorageService,
 	ses services.EmailService,
+	payment services.PaymentService,
 ) *Orchestrator {
 	return &Orchestrator{
 		db:        db,
@@ -52,6 +54,7 @@ func NewOrchestrator(
 		bedrock:   bedrock,
 		s3:        s3,
 		ses:       ses,
+		payment:   payment,
 		eventChan: make(chan models.SSEEvent, 100),
 	}
 }
@@ -68,6 +71,18 @@ func (o *Orchestrator) ProcessInvoice(ctx context.Context, invoiceID uuid.UUID) 
 		return fmt.Errorf("extraction failed: %w", err)
 	}
 	o.emitEvent(invoiceID, StepExtract, "completed", "Fields extracted successfully")
+
+	// ── Step 1b: VENDOR RESOLUTION ──────────
+	// Try to match the extracted vendor_name to a registered vendor.
+	// If found, set vendor_id on the invoice so validation can proceed.
+	// If not found, reject immediately with a clear reason.
+	if err := o.resolveVendor(ctx, invoiceID, extractedFields); err != nil {
+		reason := err.Error()
+		o.updateInvoiceStatus(invoiceID, models.InvoiceStatusRejected, reason, []string{reason})
+		o.insertAuditLog(invoiceID, StepExtract, "failed", reason, 1.0)
+		o.emitEvent(invoiceID, StepExtract, "failed", reason)
+		return err
+	}
 
 	// ── Step 2: VALIDATE ────────────────────
 	// Results are written to invoice_validations — the invoices table is NOT
@@ -114,12 +129,74 @@ func (o *Orchestrator) ProcessInvoice(ctx context.Context, invoiceID uuid.UUID) 
 
 // ── Pipeline Step Implementations ───────────
 
+// resolveVendor looks up the vendor_name extracted from the invoice in the
+// vendors table (case-insensitive, partial match). If found, it writes the
+// vendor_id back to the invoice row so downstream validation can use it.
+// If no match is found, it returns an error that causes immediate rejection.
+func (o *Orchestrator) resolveVendor(ctx context.Context, invoiceID uuid.UUID, fields map[string]interface{}) error {
+	// Check if vendor_id is already set on the invoice
+	var existingVendorID *string
+	_ = o.db.QueryRowContext(ctx, `SELECT vendor_id::text FROM invoices WHERE id = $1`, invoiceID).Scan(&existingVendorID)
+	if existingVendorID != nil && *existingVendorID != "" {
+		return nil // already resolved
+	}
+
+	vendorName, _ := fields["vendor_name"].(string)
+	if vendorName == "" {
+		return fmt.Errorf("vendor not registered: invoice does not contain a vendor name")
+	}
+
+	// Try exact match first, then case-insensitive partial match
+	var vendorID string
+	var matchedName string
+	err := o.db.QueryRowContext(ctx,
+		`SELECT id::text, name FROM vendors WHERE LOWER(name) = LOWER($1) LIMIT 1`,
+		vendorName,
+	).Scan(&vendorID, &matchedName)
+
+	if err != nil {
+		// Try partial match (e.g. "Kolkata Paper Mart" matches "Kolkata Paper Mart Pvt Ltd")
+		err = o.db.QueryRowContext(ctx,
+			`SELECT id::text, name FROM vendors WHERE LOWER(name) LIKE '%' || LOWER($1) || '%' OR LOWER($1) LIKE '%' || LOWER(name) || '%' LIMIT 1`,
+			vendorName,
+		).Scan(&vendorID, &matchedName)
+	}
+
+	if err != nil {
+		return fmt.Errorf("vendor not registered: '%s' is not a registered vendor — please add them to the system before processing this invoice", vendorName)
+	}
+
+	// Write vendor_id back to the invoice row
+	_, err = o.db.ExecContext(ctx, `UPDATE invoices SET vendor_id = $1 WHERE id = $2`, vendorID, invoiceID)
+	if err != nil {
+		return fmt.Errorf("failed to set vendor_id: %w", err)
+	}
+	o.logger.Info("Vendor resolved from invoice",
+		zap.String("invoice_id", invoiceID.String()),
+		zap.String("vendor_name", vendorName),
+		zap.String("matched_vendor", matchedName),
+		zap.String("vendor_id", vendorID),
+	)
+	return nil
+}
+
 func (o *Orchestrator) extract(ctx context.Context, invoiceID uuid.UUID) (map[string]interface{}, error) {
 	o.logger.Info("Extracting invoice fields", zap.String("invoice_id", invoiceID.String()))
 
 	var rawURLPtr *string
 	var extractedJSON []byte
-	err := o.db.QueryRow(`SELECT raw_file_url, extracted_fields FROM invoices WHERE id = $1`, invoiceID).Scan(&rawURLPtr, &extractedJSON)
+	var invoiceNumber, poReference, currency *string
+	var totalAmount, taxAmount float64
+	var invoiceDate, dueDate *time.Time
+	err := o.db.QueryRow(`
+		SELECT raw_file_url, extracted_fields,
+		       invoice_number, po_reference, currency,
+		       total_amount, tax_amount, invoice_date, due_date
+		FROM invoices WHERE id = $1`, invoiceID).Scan(
+		&rawURLPtr, &extractedJSON,
+		&invoiceNumber, &poReference, &currency,
+		&totalAmount, &taxAmount, &invoiceDate, &dueDate,
+	)
 	if err != nil {
 		return nil, fmt.Errorf("invoice not found: %w", err)
 	}
@@ -128,6 +205,7 @@ func (o *Orchestrator) extract(ctx context.Context, invoiceID uuid.UUID) (map[st
 		rawURL = *rawURLPtr
 	}
 
+	// ── 1. Already have extracted fields ────────────────────────────────
 	var extractedFields map[string]interface{}
 	if len(extractedJSON) > 0 && string(extractedJSON) != "{}" && string(extractedJSON) != "null" {
 		if err := json.Unmarshal(extractedJSON, &extractedFields); err == nil && len(extractedFields) > 0 {
@@ -136,24 +214,65 @@ func (o *Orchestrator) extract(ctx context.Context, invoiceID uuid.UUID) (map[st
 		}
 	}
 
+	// ── 2. Have a PDF in S3 — extract via Bedrock ────────────────────────
 	if rawURL != "" {
-		// Get file from storage (key from URL or invoice ID)
-		key := "invoices/" + invoiceID.String()
+		// Derive the S3 key from the raw_file_url path (preserves the file extension)
+		key := rawURL
+		if idx := strings.Index(rawURL, ".amazonaws.com/"); idx != -1 {
+			key = rawURL[idx+len(".amazonaws.com/"):]
+		} else if idx := strings.Index(rawURL, "/mock-files/"); idx != -1 {
+			key = rawURL[idx+len("/mock-files/"):]
+		}
 		data, err := o.s3.GetFile(ctx, key)
 		if err == nil && len(data) > 0 {
 			extractedFields, err = o.bedrock.ExtractInvoiceFields(ctx, data, "application/pdf")
-			if err != nil && !o.cfg.MockMode {
-				return nil, err
-			}
-			if extractedFields != nil {
+			if err != nil {
+				o.logger.Warn("Bedrock PDF extraction failed, falling through", zap.Error(err))
+			} else if extractedFields != nil {
 				o.persistExtractedFields(invoiceID, extractedFields)
-				o.insertAuditLog(invoiceID, StepExtract, "completed", "Extracted fields via LLM", 0.95)
+				o.insertAuditLog(invoiceID, StepExtract, "completed", "Extracted fields via LLM from PDF", 0.95)
 				return extractedFields, nil
 			}
 		}
 	}
 
-	// Mock response for development
+	// ── 3. No PDF — build fields directly from DB row ───────────────────
+	// Seed data and JSON-uploaded invoices already have structured fields;
+	// skip Bedrock and use them directly so the pipeline can proceed.
+	str := func(p *string) string {
+		if p == nil {
+			return ""
+		}
+		return *p
+	}
+	dateStr := func(p *time.Time) string {
+		if p == nil {
+			return ""
+		}
+		return p.Format("2006-01-02")
+	}
+	invNumStr := str(invoiceNumber)
+	poRefStr := str(poReference)
+	currencyStr := str(currency)
+	if currencyStr == "" {
+		currencyStr = "INR"
+	}
+	if invNumStr != "" || poRefStr != "" || totalAmount > 0 {
+		extractedFields = map[string]interface{}{
+			"invoice_number": invNumStr,
+			"po_reference":   poRefStr,
+			"currency":       currencyStr,
+			"total_amount":   totalAmount,
+			"tax_amount":     taxAmount,
+			"invoice_date":   dateStr(invoiceDate),
+			"due_date":       dateStr(dueDate),
+		}
+		o.persistExtractedFields(invoiceID, extractedFields)
+		o.insertAuditLog(invoiceID, StepExtract, "completed", "Used structured DB fields directly", 1.0)
+		return extractedFields, nil
+	}
+
+	// ── 4. Mock fallback ─────────────────────────────────────────────────
 	if o.cfg.MockMode {
 		extractedFields = map[string]interface{}{
 			"vendor_name":    "Acme Corp",
@@ -174,7 +293,7 @@ func (o *Orchestrator) extract(ctx context.Context, invoiceID uuid.UUID) (map[st
 		return extractedFields, nil
 	}
 
-	return nil, fmt.Errorf("extraction not implemented without mock or existing data")
+	return nil, fmt.Errorf("extraction failed: no PDF available and Bedrock returned no fields")
 }
 
 // runValidation is the authoritative validation step. It writes a full record
@@ -273,10 +392,11 @@ func (o *Orchestrator) runValidation(
 			rec.VendorValid = boolPtr(true)
 			addCheck("vendor_exists", true,
 				fmt.Sprintf("vendor '%s' (id: %s) is a registered vendor", matchedName, invVendorID))
-			// Soft check: vendor name on invoice matches DB name
+			// Informational only: note if invoice name differs from DB name (case-insensitive fuzzy match already confirmed vendor)
 			if vendorName != "" && !strings.EqualFold(strings.TrimSpace(vendorName), strings.TrimSpace(matchedName)) {
-				addCheck("vendor_name_match", false,
-					fmt.Sprintf("invoice vendor name '%s' does not match registered name '%s'", vendorName, matchedName))
+				// Add as a passed check with a note — not a failure, resolveVendor already confirmed this vendor
+				addCheck("vendor_name_match", true,
+					fmt.Sprintf("invoice vendor name '%s' matched to registered vendor '%s' (fuzzy match)", vendorName, matchedName))
 			} else {
 				addCheck("vendor_name_match", true,
 					fmt.Sprintf("vendor name '%s' matches", matchedName))
@@ -508,24 +628,37 @@ func (o *Orchestrator) runValidation(
 			zap.Float64("confidence", llmResult.Confidence),
 			zap.Strings("risk_flags", llmResult.RiskFlags),
 		)
-		// Merge LLM findings into check results
-		for _, disc := range llmResult.AdditionalDiscrepancies {
-			addCheck("llm_discrepancy", false, "LLM: "+disc)
-			hasSoft = true
-		}
-		for _, flag := range llmResult.RiskFlags {
-			addCheck("llm_risk_flag", false, "LLM risk: "+flag)
-			hasSoft = true
-		}
-		// Escalate based on LLM assessment
+		// Escalate based on LLM overall assessment — individual risk flags are
+		// informational only and do not change the outcome unless the LLM says FLAG/REJECT.
 		switch llmResult.OverallAssessment {
 		case "REJECT":
 			if !hasFail {
 				hasFail = true
 				rec.FailureReasons = append(rec.FailureReasons, "LLM audit: "+llmResult.Explanation)
 			}
+			// Record discrepancies and risk flags as informational
+			for _, disc := range llmResult.AdditionalDiscrepancies {
+				addCheck("llm_discrepancy", false, "LLM: "+disc)
+			}
+			for _, flag := range llmResult.RiskFlags {
+				addCheck("llm_risk_flag", false, "LLM risk: "+flag)
+			}
 		case "FLAG":
 			hasSoft = true
+			for _, disc := range llmResult.AdditionalDiscrepancies {
+				addCheck("llm_discrepancy", false, "LLM: "+disc)
+			}
+			for _, flag := range llmResult.RiskFlags {
+				addCheck("llm_risk_flag", false, "LLM risk: "+flag)
+			}
+		default:
+			// APPROVE — record findings as informational, do not affect outcome
+			for _, disc := range llmResult.AdditionalDiscrepancies {
+				addCheck("llm_discrepancy", true, "LLM note: "+disc)
+			}
+			for _, flag := range llmResult.RiskFlags {
+				addCheck("llm_risk_flag", true, "LLM note: "+flag)
+			}
 		}
 		// Store LLM explanation in check results
 		addCheck("llm_audit", llmResult.OverallAssessment != "REJECT",
@@ -700,20 +833,81 @@ func (o *Orchestrator) schedulePayment(ctx context.Context, invoiceID uuid.UUID,
 	o.emitEvent(invoiceID, StepSchedule, "in_progress", "Calculating optimal payment date...")
 
 	var paymentTermsDays int
-	err := o.db.QueryRow(`SELECT v.payment_terms_days FROM invoices i JOIN vendors v ON i.vendor_id = v.id WHERE i.id = $1`, invoiceID).Scan(&paymentTermsDays)
+	var vendorEmail string
+	err := o.db.QueryRow(`SELECT v.payment_terms_days, v.email FROM invoices i JOIN vendors v ON i.vendor_id = v.id WHERE i.id = $1`, invoiceID).Scan(&paymentTermsDays, &vendorEmail)
 	if err != nil || paymentTermsDays <= 0 {
 		paymentTermsDays = 30
 	}
 	paymentDate := time.Now().AddDate(0, 0, paymentTermsDays)
-	_, _ = o.db.Exec(`UPDATE invoices SET scheduled_payment_date = $1, status = $2 WHERE id = $3`,
+
+	// ── Create a Pine Labs payment link via REST API ─────────────────────
+	totalAmount, _ := fields["total_amount"].(float64)
+	invoiceNum, _ := fields["invoice_number"].(string)
+	currency, _ := fields["currency"].(string)
+	if currency == "" {
+		currency = "INR"
+	}
+
+	if totalAmount > 0 && o.payment != nil {
+		amountPaise := int64(totalAmount * 100)
+		merchantRef := fmt.Sprintf("SUPPAY-INV-%s", invoiceID.String()[:8])
+		description := fmt.Sprintf("Invoice %s — SupplierPay AI", invoiceNum)
+
+		plResp, plErr := o.payment.CreatePaymentLink(ctx, services.PaymentLinkRequest{
+			AmountValue:                  amountPaise,
+			Currency:                     currency,
+			Description:                  description,
+			MerchantPaymentLinkReference: merchantRef,
+			CustomerEmail:                vendorEmail,
+			ExpireBy:                     paymentDate.Format(time.RFC3339),
+		})
+		if plErr != nil {
+			o.logger.Warn("Pine Labs payment link creation failed — proceeding without link",
+				zap.String("invoice_id", invoiceID.String()),
+				zap.Error(plErr),
+			)
+		} else {
+			o.logger.Info("Pine Labs payment link created",
+				zap.String("invoice_id", invoiceID.String()),
+				zap.String("link_id", plResp.PaymentLinkID),
+				zap.String("link_url", plResp.PaymentLinkURL),
+			)
+			// Normalise to a consistent shape for the frontend
+			linkJSON, _ := json.Marshal(map[string]string{
+				"payment_link_id":  plResp.PaymentLinkID,
+				"payment_link_url": plResp.PaymentLinkURL,
+				"status":           plResp.Status,
+			})
+			_ = o.db.QueryRow(`UPDATE invoices SET decision_reason = $1 WHERE id = $2 RETURNING id`,
+				fmt.Sprintf("Auto-approved. Payment scheduled for %s. Pine Labs link: %s",
+					paymentDate.Format("2006-01-02"), string(linkJSON)),
+				invoiceID,
+			).Scan(new(uuid.UUID))
+		}
+	}
+
+	// Atomically transition to SCHEDULED only if the invoice is not already
+	// in a terminal state. This prevents double-scheduling on reprocessing.
+	res, schedErr := o.db.Exec(
+		`UPDATE invoices SET scheduled_payment_date = $1, status = $2 WHERE id = $3 AND status NOT IN ('SCHEDULED','APPROVED','REJECTED','PAID')`,
 		paymentDate, models.InvoiceStatusScheduled, invoiceID)
+	if schedErr != nil {
+		return fmt.Errorf("schedule payment update: %w", schedErr)
+	}
+	rows, _ := res.RowsAffected()
+	if rows == 0 {
+		// Invoice already in a terminal state — skip PO decrement to avoid double-counting.
+		o.logger.Info("Invoice already scheduled/terminal, skipping PO decrement",
+			zap.String("invoice_id", invoiceID.String()),
+		)
+		return nil
+	}
 	o.logger.Info("Payment scheduled",
 		zap.String("invoice_id", invoiceID.String()),
 		zap.Time("payment_date", paymentDate),
 	)
 
-	// ── Decrement PO remaining_value and update PO status ────────────────
-	// This keeps the PO balance accurate for future invoices against the same PO.
+	// ── Decrement PO remaining_value exactly once per invoice ────────────
 	poRef, _ := fields["po_reference"].(string)
 	invTotal, _ := toFloat(fields["total_amount"])
 	if poRef != "" && invTotal > 0 {
@@ -721,8 +915,8 @@ func (o *Orchestrator) schedulePayment(ctx context.Context, invoiceID uuid.UUID,
 			UPDATE purchase_orders
 			   SET remaining_value = GREATEST(0, remaining_value - $1),
 			       status = CASE
-			                  WHEN GREATEST(0, remaining_value - $1) = 0 THEN 'CLOSED'
-			                  WHEN remaining_value - $1 < total_value   THEN 'PARTIALLY_MATCHED'
+			                  WHEN GREATEST(0, remaining_value - $1) = 0          THEN 'CLOSED'
+			                  WHEN GREATEST(0, remaining_value - $1) < total_value THEN 'PARTIALLY_MATCHED'
 			                  ELSE status
 			                END,
 			       updated_at = NOW()

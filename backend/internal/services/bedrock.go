@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
@@ -29,20 +30,19 @@ func NewBedrockClient(cfg *config.Config, logger *zap.Logger) *BedrockClient {
 }
 
 // buildBedrockRuntime creates a bedrockruntime client.
-// Priority: bearer token (pre-signed URL style) → IAM key/secret → default chain.
+// Priority: explicit IAM key/secret from env → default credential chain.
 func buildBedrockRuntime(cfg *config.Config, logger *zap.Logger) *bedrockruntime.Client {
 	region := cfg.AWSRegion
 	if region == "" {
 		region = "us-east-1"
 	}
 
-	// Bearer-token path: AWS issues a pre-signed bearer token that is passed
-	// as a static credential with a fixed key/secret pair.
-	if cfg.BedrockBearerToken != "" {
-		logger.Info("Bedrock: using bearer token auth")
+	// Explicit IAM key + secret from environment variables
+	if cfg.AWSAccessKeyID != "" && cfg.AWSSecretAccessKey != "" {
+		logger.Info("Bedrock: using IAM key/secret from environment")
 		staticCreds := credentials.NewStaticCredentialsProvider(
-			"bedrock-bearer",
-			cfg.BedrockBearerToken,
+			cfg.AWSAccessKeyID,
+			cfg.AWSSecretAccessKey,
 			"",
 		)
 		awsCfg, err := awsconfig.LoadDefaultConfig(context.Background(),
@@ -50,25 +50,14 @@ func buildBedrockRuntime(cfg *config.Config, logger *zap.Logger) *bedrockruntime
 			awsconfig.WithCredentialsProvider(staticCreds),
 		)
 		if err != nil {
-			logger.Error("Bedrock: failed to build AWS config with bearer token", zap.Error(err))
+			logger.Error("Bedrock: failed to build AWS config with IAM keys", zap.Error(err))
 		} else {
 			return bedrockruntime.NewFromConfig(awsCfg)
 		}
 	}
 
-	// IAM key/secret path
-	if cfg.AWSRegion != "" {
-		logger.Info("Bedrock: using IAM credentials from env")
-		awsCfg, err := awsconfig.LoadDefaultConfig(context.Background(),
-			awsconfig.WithRegion(region),
-		)
-		if err == nil {
-			return bedrockruntime.NewFromConfig(awsCfg)
-		}
-		logger.Error("Bedrock: failed to build AWS config", zap.Error(err))
-	}
-
 	// Fallback: default credential chain (instance role, ~/.aws, etc.)
+	logger.Info("Bedrock: using default AWS credential chain")
 	awsCfg, _ := awsconfig.LoadDefaultConfig(context.Background(),
 		awsconfig.WithRegion(region),
 	)
@@ -102,15 +91,52 @@ type claudeRequest struct {
 }
 
 type claudeResponse struct {
-	Content []struct {
-		Type string `json:"type"`
-		Text string `json:"text"`
-	} `json:"content"`
+	Content []claudeResponseBlock `json:"content"`
 	StopReason string `json:"stop_reason"`
 	Usage      struct {
 		InputTokens  int `json:"input_tokens"`
 		OutputTokens int `json:"output_tokens"`
 	} `json:"usage"`
+}
+
+type claudeResponseBlock struct {
+	Type  string          `json:"type"`
+	Text  string          `json:"text,omitempty"`
+	// tool_use fields
+	ID    string          `json:"id,omitempty"`
+	Name  string          `json:"name,omitempty"`
+	Input json.RawMessage `json:"input,omitempty"`
+}
+
+// ── Tool-use (function calling) types ────────
+
+type claudeTool struct {
+	Name        string          `json:"name"`
+	Description string          `json:"description"`
+	InputSchema json.RawMessage `json:"input_schema"`
+}
+
+type claudeRequestWithTools struct {
+	AnthropicVersion string          `json:"anthropic_version"`
+	MaxTokens        int             `json:"max_tokens"`
+	System           string          `json:"system,omitempty"`
+	Messages         []claudeMessage `json:"messages"`
+	Tools            []claudeTool    `json:"tools,omitempty"`
+}
+
+// claudeToolResultBlock is used in the tool_result content block sent back to Claude.
+type claudeToolResultBlock struct {
+	Type      string `json:"type"`
+	ToolUseID string `json:"tool_use_id"`
+	Content   string `json:"content"`
+}
+
+// claudeToolUseBlock is used in the assistant message content when Claude calls a tool.
+type claudeToolUseBlock struct {
+	Type  string          `json:"type"`
+	ID    string          `json:"id"`
+	Name  string          `json:"name"`
+	Input json.RawMessage `json:"input"`
 }
 
 // invokeModel calls Bedrock InvokeModel and returns the text response.
@@ -157,8 +183,53 @@ func (b *BedrockClient) invokeModel(ctx context.Context, system, userText string
 func (b *BedrockClient) invokeModelWithImage(ctx context.Context, system, userText string, imageData []byte, mimeType string) (string, error) {
 	mediaType := mimeType
 	if mediaType == "application/pdf" {
-		// Claude vision doesn't support PDF natively; send as base64 text prompt
-		return b.invokeModel(ctx, system, userText+"\n\n[Invoice data (base64-encoded PDF)]: "+base64.StdEncoding.EncodeToString(imageData))
+		// If the bytes are valid UTF-8 text (e.g. a text file uploaded as PDF),
+		// send as plain text so Claude can read it directly.
+		if isReadableText(imageData) {
+			return b.invokeModel(ctx, system, userText+"\n\nInvoice text:\n"+string(imageData))
+		}
+		// For real PDFs use the Bedrock document block format.
+		req := claudeRequest{
+			AnthropicVersion: "bedrock-2023-05-31",
+			MaxTokens:        b.cfg.BedrockMaxTokens,
+			System:           system,
+			Messages: []claudeMessage{
+				{
+					Role: "user",
+					Content: []claudeBlock{
+						{
+							Type: "document",
+							Source: &claudeImageSource{
+								Type:      "base64",
+								MediaType: "application/pdf",
+								Data:      base64.StdEncoding.EncodeToString(imageData),
+							},
+						},
+						{Type: "text", Text: userText},
+					},
+				},
+			},
+		}
+		body, err := json.Marshal(req)
+		if err != nil {
+			return "", fmt.Errorf("marshal request: %w", err)
+		}
+		out, err := b.rt.InvokeModel(ctx, &bedrockruntime.InvokeModelInput{
+			ModelId:     aws.String(b.cfg.BedrockModelID),
+			ContentType: aws.String("application/json"),
+			Accept:      aws.String("application/json"),
+			Body:        body,
+		})
+		if err != nil {
+			// Fallback: send as plain text if document block not supported
+			b.logger.Warn("PDF document block failed, falling back to text", zap.Error(err))
+			return b.invokeModel(ctx, system, userText+"\n\nInvoice content (extracted):\n"+string(imageData))
+		}
+		var resp claudeResponse
+		if err := json.Unmarshal(out.Body, &resp); err != nil || len(resp.Content) == 0 {
+			return "", fmt.Errorf("empty/invalid response from Bedrock")
+		}
+		return resp.Content[0].Text, nil
 	}
 
 	req := claudeRequest{
@@ -321,9 +392,13 @@ func (b *BedrockClient) ValidateWithLLM(ctx context.Context, invoiceFields map[s
 	invoiceJSON, _ := json.MarshalIndent(invoiceFields, "", "  ")
 	poJSON, _ := json.MarshalIndent(poDetails, "", "  ")
 
+	today := time.Now().Format("2006-01-02")
+
 	system := `You are an expert accounts payable auditor. Analyze invoices against purchase orders and identify discrepancies. Return ONLY valid JSON.`
 
 	userPrompt := fmt.Sprintf(`Perform a semantic validation of this invoice against the purchase order.
+
+Today's date: %s
 
 Invoice Fields:
 %s
@@ -334,12 +409,19 @@ Purchase Order Details:
 Rule-Based Check Summary (already performed):
 %s
 
-Analyze for:
-1. Semantic mismatches in descriptions (e.g. "Cloud Hosting" vs "Server Rental")
-2. Suspicious amounts or patterns (round numbers, unusual tax rates)
-3. Date anomalies (invoice date in future, very old invoices)
-4. Missing or inconsistent information
-5. Any other red flags an experienced AP auditor would notice
+IMPORTANT RULES — do NOT flag the following as issues:
+- Invoice dates or due dates that are in the past (historical invoices are normal)
+- PO numbers whose year component differs from the invoice year (PO numbering conventions vary)
+- Round-number amounts on service contracts (common for fixed-price engagements)
+- GST/tax at standard Indian rates (18%%, 12%%, 5%%) applied on top of PO subtotal values
+- Items already validated as PASSED in the Rule-Based Check Summary above
+
+Analyze ONLY for:
+1. Semantic mismatches in line-item descriptions vs PO scope (e.g. "Cloud Hosting" billed against a "Security Audit" PO)
+2. Invoice total genuinely exceeding the PO remaining value (hard math check)
+3. Duplicate invoice numbers (already caught by rules — only flag if rules missed it)
+4. Missing mandatory fields (vendor name, invoice number, PO reference, total amount)
+5. Genuine fraud signals (e.g. altered amounts, mismatched vendor details)
 
 Return ONLY this JSON:
 {
@@ -349,7 +431,7 @@ Return ONLY this JSON:
   "semantic_matches": [{"invoice_desc": "string", "po_desc": "string", "match": true|false, "note": "string"}],
   "risk_flags": ["string", ...],
   "explanation": "string (2-3 sentences)"
-}`, string(invoiceJSON), string(poJSON), ruleCheckSummary)
+}`, today, string(invoiceJSON), string(poJSON), ruleCheckSummary)
 
 	text, err := b.invokeModel(ctx, system, userPrompt)
 	if err != nil {
@@ -386,6 +468,27 @@ type SemanticMatch struct {
 	PODesc      string `json:"po_desc"`
 	Match       bool   `json:"match"`
 	Note        string `json:"note"`
+}
+
+// isReadableText returns true if the byte slice is valid UTF-8 text
+// (i.e. a plain-text file uploaded with a PDF mime type).
+func isReadableText(data []byte) bool {
+	if len(data) == 0 {
+		return false
+	}
+	// Real PDFs always start with %PDF
+	if len(data) >= 4 && string(data[:4]) == "%PDF" {
+		return false
+	}
+	// Check if it's valid UTF-8 with mostly printable characters
+	text := string(data)
+	printable := 0
+	for _, r := range text {
+		if r == '\n' || r == '\r' || r == '\t' || (r >= 32 && r < 127) {
+			printable++
+		}
+	}
+	return len(text) > 0 && float64(printable)/float64(len(text)) > 0.85
 }
 
 // ── Mock LLM Client (for local dev) ─────────
@@ -459,3 +562,4 @@ func (m *MockLLMClient) ValidateWithLLM(ctx context.Context, invoiceFields map[s
 		Explanation:             "Mock LLM validation: all checks passed, invoice appears legitimate.",
 	}, nil
 }
+

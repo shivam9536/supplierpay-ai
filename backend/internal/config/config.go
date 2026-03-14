@@ -21,12 +21,13 @@ type Config struct {
 	DBSSLMode  string
 
 	// AWS General
-	AWSRegion string
+	AWSRegion           string
+	AWSAccessKeyID      string
+	AWSSecretAccessKey  string
 
 	// Bedrock
-	BedrockModelID      string
-	BedrockMaxTokens    int
-	BedrockBearerToken  string
+	BedrockModelID     string
+	BedrockMaxTokens   int
 
 	// S3
 	S3BucketName string
@@ -37,9 +38,11 @@ type Config struct {
 	SESRegion      string
 
 	// Pine Labs
-	PineLabsAPIURL     string
-	PineLabsAPIKey     string
-	PineLabsMerchantID string
+	PineLabsAPIURL        string
+	PineLabsClientID      string
+	PineLabsClientSecret  string
+	PineLabsMerchantID    string
+	PineLabsWebhookSecret string
 
 	// JWT
 	JWTSecret      string
@@ -60,11 +63,12 @@ func Load() *Config {
 		DBName:     getEnv("DB_NAME", "supplierpay"),
 		DBSSLMode:  getEnv("DB_SSLMODE", "disable"),
 
-		AWSRegion: getEnv("AWS_REGION", "ap-south-1"),
+		AWSRegion:          getEnv("AWS_REGION", "us-east-1"),
+		AWSAccessKeyID:     getEnv("AWS_ACCESS_KEY_ID", ""),
+		AWSSecretAccessKey: getEnv("AWS_SECRET_ACCESS_KEY", ""),
 
-		BedrockModelID:     getEnv("BEDROCK_MODEL_ID", "anthropic.claude-3-5-sonnet-20241022-v2:0"),
-		BedrockMaxTokens:   getEnvInt("BEDROCK_MAX_TOKENS", 4096),
-		BedrockBearerToken: getEnv("AWS_BEARER_TOKEN_BEDROCK", ""),
+		BedrockModelID:   getEnv("BEDROCK_MODEL_ID", "anthropic.claude-3-5-sonnet-20241022-v2:0"),
+		BedrockMaxTokens: getEnvInt("BEDROCK_MAX_TOKENS", 4096),
 
 		S3BucketName: getEnv("S3_BUCKET_NAME", "supplierpay-invoices"),
 		S3Region:     getEnv("S3_REGION", "ap-south-1"),
@@ -72,9 +76,11 @@ func Load() *Config {
 		SESSenderEmail: getEnv("SES_SENDER_EMAIL", "noreply@supplierpay.ai"),
 		SESRegion:      getEnv("SES_REGION", "ap-south-1"),
 
-		PineLabsAPIURL:     getEnv("PINELABS_API_URL", "https://sandbox.pinelabs.com/api/v1"),
-		PineLabsAPIKey:     getEnv("PINELABS_API_KEY", ""),
-		PineLabsMerchantID: getEnv("PINELABS_MERCHANT_ID", ""),
+		PineLabsAPIURL:        getEnv("PINELABS_API_URL", "https://pluraluat.v2.pinepg.in/api"),
+		PineLabsClientID:      getEnv("PINELABS_CLIENT_ID", ""),
+		PineLabsClientSecret:  getEnv("PINELABS_CLIENT_SECRET", ""),
+		PineLabsMerchantID:    getEnv("PINELABS_MERCHANT_ID", ""),
+		PineLabsWebhookSecret: getEnv("PINELABS_WEBHOOK_SECRET", ""),
 
 		JWTSecret:      getEnv("JWT_SECRET", "supplierpay-hackathon-secret"),
 		JWTExpiryHours: getEnvInt("JWT_EXPIRY_HOURS", 24),

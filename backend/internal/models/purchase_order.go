@@ -23,7 +23,7 @@ type PurchaseOrder struct {
 	TotalValue     float64   `db:"total_value" json:"total_value"`
 	RemainingValue float64   `db:"remaining_value" json:"remaining_value"`
 	LineItems      RawJSON   `db:"line_items" json:"line_items"`
-	ApprovedBy     string    `db:"approved_by" json:"approved_by"`
+	ApprovedBy     *string   `db:"approved_by" json:"approved_by"`
 	Status         POStatus  `db:"status" json:"status"`
 	CreatedAt      time.Time `db:"created_at" json:"created_at"`
 	UpdatedAt      time.Time `db:"updated_at" json:"updated_at"`

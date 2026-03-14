@@ -46,6 +46,9 @@ type PaymentService interface {
 
 	// GetTransactionStatus checks status of a payment
 	GetTransactionStatus(ctx context.Context, transactionID string) (*TransactionStatus, error)
+
+	// CreatePaymentLink creates a Pine Labs payment link for an invoice
+	CreatePaymentLink(ctx context.Context, req PaymentLinkRequest) (*PaymentLinkResponse, error)
 }
 
 // ── Payment Service DTOs ────────────────────
