@@ -60,6 +60,12 @@ type Invoice struct {
 	UpdatedAt             time.Time     `db:"updated_at" json:"updated_at"`
 }
 
+// InvoiceWithVendor is used for list responses with vendor name joined.
+type InvoiceWithVendor struct {
+	Invoice
+	VendorName string `db:"vendor_name" json:"vendor_name"`
+}
+
 // ── Invoice Create Request ──────────────────
 type InvoiceUploadRequest struct {
 	VendorID      string `json:"vendor_id" binding:"required"`

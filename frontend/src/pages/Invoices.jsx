@@ -1,37 +1,8 @@
+import { useState, useEffect } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { FileText, Eye } from 'lucide-react'
 import clsx from 'clsx'
-
-// Mock data — will be replaced with API calls
-const mockInvoices = [
-  {
-    id: 'aaaa1111-1111-1111-1111-111111111111',
-    invoice_number: 'INV-ACME-2026-042',
-    vendor_name: 'Acme Cloud Solutions',
-    total_amount: 50000,
-    status: 'APPROVED',
-    due_date: '2026-03-31',
-    scheduled_payment_date: '2026-03-29',
-  },
-  {
-    id: 'bbbb2222-2222-2222-2222-222222222222',
-    invoice_number: 'INV-TP-2026-118',
-    vendor_name: 'TechParts India Pvt Ltd',
-    total_amount: 135000,
-    status: 'FLAGGED',
-    due_date: '2026-04-07',
-    scheduled_payment_date: null,
-  },
-  {
-    id: 'cccc3333-3333-3333-3333-333333333333',
-    invoice_number: 'INV-SN-2026-007',
-    vendor_name: 'SecureNet Cybersecurity',
-    total_amount: 200000,
-    status: 'SCHEDULED',
-    due_date: '2026-04-04',
-    scheduled_payment_date: '2026-03-15',
-  },
-]
+import { getInvoices } from '../services/api'
 
 const statusStyles = {
   PENDING: 'bg-gray-100 text-gray-700',
@@ -44,10 +15,42 @@ const statusStyles = {
   PAID: 'bg-emerald-100 text-emerald-700',
 }
 
+function formatDate(val) {
+  if (!val) return '—'
+  const d = typeof val === 'string' ? new Date(val) : val
+  return isNaN(d.getTime()) ? '—' : d.toISOString().slice(0, 10)
+}
+
 export default function Invoices() {
   const navigate = useNavigate()
+  const [invoices, setInvoices] = useState([])
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState('')
 
-  // TODO: Dev 4 — Replace with API call: getInvoices()
+  useEffect(() => {
+    getInvoices()
+      .then((res) => {
+        if (res.data?.success && Array.isArray(res.data.data)) setInvoices(res.data.data)
+      })
+      .catch(() => setError('Failed to load invoices'))
+      .finally(() => setLoading(false))
+  }, [])
+
+  if (loading) {
+    return (
+      <div className="flex items-center justify-center py-12">
+        <p className="text-gray-500">Loading invoices...</p>
+      </div>
+    )
+  }
+
+  if (error) {
+    return (
+      <div className="flex items-center justify-center py-12">
+        <p className="text-red-600">{error}</p>
+      </div>
+    )
+  }
 
   return (
     <div>
@@ -79,25 +82,25 @@ export default function Invoices() {
             </tr>
           </thead>
           <tbody className="divide-y divide-gray-100">
-            {mockInvoices.map((inv) => (
+            {invoices.map((inv) => (
               <tr key={inv.id} className="hover:bg-gray-50 transition-colors">
                 <td className="px-6 py-4">
                   <div className="flex items-center gap-2">
                     <FileText className="w-4 h-4 text-gray-400" />
-                    <span className="text-sm font-medium text-gray-900">{inv.invoice_number}</span>
+                    <span className="text-sm font-medium text-gray-900">{inv.invoice_number || '—'}</span>
                   </div>
                 </td>
-                <td className="px-6 py-4 text-sm text-gray-600">{inv.vendor_name}</td>
+                <td className="px-6 py-4 text-sm text-gray-600">{inv.vendor_name || inv.vendor_id || '—'}</td>
                 <td className="px-6 py-4 text-sm text-gray-900 text-right font-medium">
-                  ₹{inv.total_amount.toLocaleString('en-IN')}
+                  ₹{Number(inv.total_amount || 0).toLocaleString('en-IN')}
                 </td>
                 <td className="px-6 py-4 text-center">
-                  <span className={clsx('px-2.5 py-1 rounded-full text-xs font-medium', statusStyles[inv.status])}>
+                  <span className={clsx('px-2.5 py-1 rounded-full text-xs font-medium', statusStyles[inv.status] || 'bg-gray-100 text-gray-700')}>
                     {inv.status}
                   </span>
                 </td>
-                <td className="px-6 py-4 text-sm text-gray-600">{inv.due_date}</td>
-                <td className="px-6 py-4 text-sm text-gray-600">{inv.scheduled_payment_date || '—'}</td>
+                <td className="px-6 py-4 text-sm text-gray-600">{formatDate(inv.due_date)}</td>
+                <td className="px-6 py-4 text-sm text-gray-600">{formatDate(inv.scheduled_payment_date)}</td>
                 <td className="px-6 py-4 text-center">
                   <button
                     onClick={() => navigate(`/invoices/${inv.id}`)}

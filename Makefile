@@ -30,13 +30,13 @@ logs-frontend: ## Tail frontend logs
 db-shell: ## Open psql shell
 	docker compose exec postgres psql -U supplierpay -d supplierpay
 
-db-reset: ## Reset database (drop + recreate + seed)
+	db-reset: ## Reset database (drop + recreate + seed)
 	docker compose down -v
 	docker compose up postgres -d
 	@echo "Waiting for Postgres to be ready..."
-	@sleep 3
-	docker compose exec postgres psql -U supplierpay -d supplierpay -f /docker-entrypoint-initdb.d/migrations/001_init.sql
-	docker compose exec postgres psql -U supplierpay -d supplierpay -f /docker-entrypoint-initdb.d/seed/001_seed.sql
+	@sleep 5
+	docker compose exec postgres psql -U supplierpay -d supplierpay -f /docker-entrypoint-initdb.d/01_init.sql
+	docker compose exec postgres psql -U supplierpay -d supplierpay -f /docker-entrypoint-initdb.d/02_seed.sql
 	@echo "Database reset complete!"
 
 # ── Individual Service Commands ──────────────

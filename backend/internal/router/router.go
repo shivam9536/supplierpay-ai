@@ -4,13 +4,16 @@ import (
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
 	"github.com/jmoiron/sqlx"
+	"github.com/supplierpay/backend/internal/agent"
 	"github.com/supplierpay/backend/internal/config"
+	"github.com/supplierpay/backend/internal/events"
 	"github.com/supplierpay/backend/internal/handlers"
 	"github.com/supplierpay/backend/internal/middleware"
+	"github.com/supplierpay/backend/internal/services"
 	"go.uber.org/zap"
 )
 
-func Setup(db *sqlx.DB, cfg *config.Config, logger *zap.Logger) *gin.Engine {
+func Setup(db *sqlx.DB, cfg *config.Config, logger *zap.Logger, orch *agent.Orchestrator, broadcaster *events.Broadcaster, storage services.StorageService) *gin.Engine {
 	if cfg.AppEnv == "production" {
 		gin.SetMode(gin.ReleaseMode)
 	}
@@ -31,12 +34,12 @@ func Setup(db *sqlx.DB, cfg *config.Config, logger *zap.Logger) *gin.Engine {
 	})
 
 	// Initialize handlers
-	invoiceHandler := handlers.NewInvoiceHandler(db, cfg, logger)
+	invoiceHandler := handlers.NewInvoiceHandler(db, cfg, logger, orch, storage)
 	vendorHandler := handlers.NewVendorHandler(db, logger)
 	poHandler := handlers.NewPurchaseOrderHandler(db, logger)
 	paymentHandler := handlers.NewPaymentHandler(db, cfg, logger)
 	forecastHandler := handlers.NewForecastHandler(db, logger)
-	sseHandler := handlers.NewSSEHandler(logger)
+	sseHandler := handlers.NewSSEHandler(logger, broadcaster)
 
 	// ── API v1 Routes ───────────────────────
 	v1 := r.Group("/api/v1")

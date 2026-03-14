@@ -20,12 +20,29 @@ func NewPaymentHandler(db *sqlx.DB, cfg *config.Config, logger *zap.Logger) *Pay
 	return &PaymentHandler{db: db, cfg: cfg, logger: logger}
 }
 
-// GetSchedule returns upcoming scheduled payments
+// GetSchedule returns upcoming scheduled payments (invoices with status SCHEDULED, scheduled_payment_date >= today)
 func (h *PaymentHandler) GetSchedule(c *gin.Context) {
-	// TODO: Dev 1 — Query invoices with status SCHEDULED, grouped by date
+	var invoices []models.Invoice
+	err := h.db.Select(&invoices, `SELECT id, vendor_id, invoice_number, po_reference, raw_file_url, extracted_fields, line_items,
+		total_amount, tax_amount, currency, invoice_date, due_date, status, discrepancies, decision_reason,
+		scheduled_payment_date, pinelabs_transaction_id, created_at, updated_at
+		FROM invoices
+		WHERE status = $1 AND scheduled_payment_date >= CURRENT_DATE
+		ORDER BY scheduled_payment_date ASC`,
+		models.InvoiceStatusScheduled)
+	if err != nil {
+		h.logger.Error("Failed to get payment schedule", zap.Error(err))
+		c.JSON(http.StatusInternalServerError, models.APIResponse{
+			Success: false, Error: "Failed to get schedule",
+		})
+		return
+	}
+	if invoices == nil {
+		invoices = []models.Invoice{}
+	}
 	c.JSON(http.StatusOK, models.APIResponse{
 		Success: true,
-		Data:    []interface{}{},
+		Data:    invoices,
 	})
 }
 
@@ -47,9 +64,19 @@ func (h *PaymentHandler) TriggerRun(c *gin.Context) {
 
 // ListRuns returns history of payment runs
 func (h *PaymentHandler) ListRuns(c *gin.Context) {
-	// TODO: Dev 1 — Query payment runs
-	runs := []models.PaymentRun{}
-
+	var runs []models.PaymentRun
+	err := h.db.Select(&runs, `SELECT id, run_date, total_amount, invoice_count, status, pinelabs_batch_id, created_at, updated_at
+		FROM payment_runs ORDER BY run_date DESC LIMIT 50`)
+	if err != nil {
+		h.logger.Error("Failed to list payment runs", zap.Error(err))
+		c.JSON(http.StatusInternalServerError, models.APIResponse{
+			Success: false, Error: "Failed to list runs",
+		})
+		return
+	}
+	if runs == nil {
+		runs = []models.PaymentRun{}
+	}
 	c.JSON(http.StatusOK, models.APIResponse{
 		Success: true,
 		Data:    runs,
