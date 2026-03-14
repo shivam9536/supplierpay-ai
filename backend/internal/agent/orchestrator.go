@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -18,12 +19,11 @@ import (
 type PipelineStep string
 
 const (
-	StepExtract        PipelineStep = "EXTRACT"
-	StepValidate       PipelineStep = "VALIDATE"
-	StepCrossReference PipelineStep = "CROSS_REFERENCE"
-	StepDecision       PipelineStep = "DECISION"
-	StepDraftQuery     PipelineStep = "DRAFT_QUERY"
-	StepSchedule       PipelineStep = "SCHEDULE"
+	StepExtract    PipelineStep = "EXTRACT"
+	StepValidate   PipelineStep = "VALIDATE"
+	StepDecision   PipelineStep = "DECISION"
+	StepDraftQuery PipelineStep = "DRAFT_QUERY"
+	StepSchedule   PipelineStep = "SCHEDULE"
 )
 
 // ── Orchestrator ────────────────────────────
@@ -70,41 +70,41 @@ func (o *Orchestrator) ProcessInvoice(ctx context.Context, invoiceID uuid.UUID) 
 	o.emitEvent(invoiceID, StepExtract, "completed", "Fields extracted successfully")
 
 	// ── Step 2: VALIDATE ────────────────────
-	o.emitEvent(invoiceID, StepValidate, "in_progress", "Validating invoice data...")
-	validationErrors := o.validate(extractedFields)
-	if len(validationErrors) > 0 {
-		o.emitEvent(invoiceID, StepValidate, "failed", fmt.Sprintf("Validation failed: %v", validationErrors))
-		o.updateInvoiceStatus(invoiceID, models.InvoiceStatusRejected, "", nil)
-		o.insertAuditLog(invoiceID, StepValidate, "failed", fmt.Sprintf("Validation failed: %v", validationErrors), 0)
-		return fmt.Errorf("validation failed: %v", validationErrors)
-	}
-	o.emitEvent(invoiceID, StepValidate, "completed", "Validation passed")
-	o.insertAuditLog(invoiceID, StepValidate, "completed", "All required fields present, amounts valid", 1.0)
-
-	// ── Step 3: CROSS-REFERENCE ─────────────
-	o.emitEvent(invoiceID, StepCrossReference, "in_progress", "Matching against purchase orders...")
-	matchResult, err := o.crossReference(ctx, invoiceID, extractedFields)
+	// Results are written to invoice_validations — the invoices table is NOT
+	// modified here (status stays EXTRACTING until DECISION step).
+	o.emitEvent(invoiceID, StepValidate, "in_progress", "Validating invoice fields, vendor and PO line items...")
+	valRec, err := o.runValidation(ctx, invoiceID, extractedFields)
 	if err != nil {
-		o.emitEvent(invoiceID, StepCrossReference, "failed", err.Error())
-		return fmt.Errorf("cross-reference failed: %w", err)
+		o.emitEvent(invoiceID, StepValidate, "failed", err.Error())
+		return fmt.Errorf("validation error: %w", err)
 	}
-	o.emitEvent(invoiceID, StepCrossReference, "completed", matchResult.Summary)
+	if valRec.ValidationStatus == models.ValidationStatusFailed {
+		o.emitEvent(invoiceID, StepValidate, "failed",
+			fmt.Sprintf("Validation failed (%d checks): %s", len(valRec.FailureReasons), valRec.Summary))
+		o.updateInvoiceStatus(invoiceID, models.InvoiceStatusRejected, valRec.Summary, valRec.FailureReasons)
+		o.insertAuditLog(invoiceID, StepValidate, "failed", valRec.Summary, 0)
+		return fmt.Errorf("validation failed: %s", valRec.Summary)
+	}
+	o.emitEvent(invoiceID, StepValidate, "completed", valRec.Summary)
+	o.insertAuditLog(invoiceID, StepValidate, "completed", valRec.Summary, 1.0)
 
-	// ── Step 4: DECISION ────────────────────
+	// ── Step 3: DECISION ────────────────────
+	// Driven entirely from the invoice_validations record — no separate
+	// crossReference step needed; runValidation already covers PO, vendor,
+	// items, prices, amounts and duplicates.
 	o.emitEvent(invoiceID, StepDecision, "in_progress", "Making approval decision...")
-	decision := o.makeDecision(matchResult)
+	decision := o.makeDecision(valRec)
 	o.emitEvent(invoiceID, StepDecision, "completed", decision.Reason)
 
-	// ── Step 5: ACTION ──────────────────────
 	statusStr := decisionActionToStatus(decision.Action)
-	o.updateInvoiceStatus(invoiceID, statusStr, decision.Reason, nil)
+	o.updateInvoiceStatus(invoiceID, statusStr, decision.Reason, valRec.FailureReasons)
 	o.insertAuditLog(invoiceID, StepDecision, "completed", decision.Reason, 1.0)
 
 	switch decision.Action {
 	case "APPROVE":
 		return o.schedulePayment(ctx, invoiceID, extractedFields)
 	case "FLAG":
-		return o.draftQueryEmail(ctx, invoiceID, matchResult)
+		return o.draftQueryEmailFromValidation(ctx, invoiceID, valRec)
 	case "REJECT":
 		return nil
 	}
@@ -173,93 +173,444 @@ func (o *Orchestrator) extract(ctx context.Context, invoiceID uuid.UUID) (map[st
 	return nil, fmt.Errorf("extraction not implemented without mock or existing data")
 }
 
-func (o *Orchestrator) validate(fields map[string]interface{}) []string {
-	var errors []string
-	if amount, ok := fields["total_amount"].(float64); ok && amount <= 0 {
-		errors = append(errors, "Total amount must be greater than 0")
-	}
-	requiredFields := []string{"vendor_name", "invoice_number", "total_amount"}
-	for _, field := range requiredFields {
-		if _, ok := fields[field]; !ok {
-			errors = append(errors, fmt.Sprintf("Missing required field: %s", field))
-		}
-	}
-	// due_date optional for validation
-	return errors
-}
+// runValidation is the authoritative validation step. It writes a full record
+// to invoice_validations (never touching the invoices table) covering:
+//  1. Required field presence and data-type sanity
+//  2. Vendor exists in the vendors table
+//  3. PO (order number) exists and is open
+//  4. Vendor on the invoice matches the PO vendor
+//  5. No duplicate invoice number
+//  6. Every ordered item found in PO with matching description
+//  7. Unit prices within 2 % tolerance
+//  8. Invoice total does not exceed PO remaining_value
+func (o *Orchestrator) runValidation(
+	ctx context.Context,
+	invoiceID uuid.UUID,
+	fields map[string]interface{},
+) (*models.InvoiceValidation, error) {
 
-type MatchResult struct {
-	POFound         bool
-	AmountMatch     bool
-	LineItemsMatch  bool
-	Discrepancies   []string
-	Summary         string
-	DiscrepancyType string // AMOUNT_MISMATCH, PO_NOT_FOUND, DUPLICATE_INVOICE, LINE_ITEM_MISMATCH
-}
-
-func (o *Orchestrator) crossReference(ctx context.Context, invoiceID uuid.UUID, fields map[string]interface{}) (*MatchResult, error) {
-	o.logger.Info("Cross-referencing invoice", zap.String("invoice_id", invoiceID.String()))
-
-	poRef, _ := fields["po_reference"].(string)
-	invNum, _ := fields["invoice_number"].(string)
-	invTotal, _ := fields["total_amount"].(float64)
-
-	result := &MatchResult{POFound: false, AmountMatch: false, LineItemsMatch: false, Discrepancies: []string{}}
-
-	if poRef == "" {
-		result.DiscrepancyType = "PO_NOT_FOUND"
-		result.Summary = "No PO reference on invoice"
-		o.persistDiscrepancies(invoiceID, result.Discrepancies)
-		o.insertAuditLog(invoiceID, StepCrossReference, "completed", result.Summary, 0.8)
-		return result, nil
+	now := time.Now()
+	rec := &models.InvoiceValidation{
+		InvoiceID:        invoiceID,
+		ValidationStatus: models.ValidationStatusRunning,
+		StartedAt:        now,
+		CheckResults:     models.CheckResults{},
+		LineItemResults:  models.LineItemResults{},
+		FailureReasons:   models.StringSlice{},
 	}
 
-	var poTotal float64
-	var poRemaining float64
-	var lineItemsJSON []byte
-	err := o.db.QueryRow(`SELECT total_value, remaining_value, line_items FROM purchase_orders WHERE po_number = $1`, poRef).Scan(&poTotal, &poRemaining, &lineItemsJSON)
-	if err != nil {
-		result.DiscrepancyType = "PO_NOT_FOUND"
-		result.Summary = "Purchase order not found: " + poRef
-		result.Discrepancies = append(result.Discrepancies, "PO "+poRef+" not found")
-		o.persistDiscrepancies(invoiceID, result.Discrepancies)
-		o.insertAuditLog(invoiceID, StepCrossReference, "completed", result.Summary, 0.8)
-		return result, nil
+	// Persist as RUNNING so it's visible immediately
+	if err := o.upsertValidationRecord(rec); err != nil {
+		return nil, fmt.Errorf("could not create validation record: %w", err)
 	}
-	result.POFound = true
 
-	// Duplicate invoice number check (only if we have an invoice number)
-	if invNum != "" {
-		var duplicateCount int
-		_ = o.db.Get(&duplicateCount, `SELECT COUNT(*) FROM invoices WHERE invoice_number = $1 AND id != $2`, invNum, invoiceID)
-		if duplicateCount > 0 {
-		result.DiscrepancyType = "DUPLICATE_INVOICE"
-		result.Summary = "Duplicate invoice number: " + invNum
-			result.Discrepancies = append(result.Discrepancies, "Duplicate invoice number")
-			o.persistDiscrepancies(invoiceID, result.Discrepancies)
-			o.insertAuditLog(invoiceID, StepCrossReference, "completed", result.Summary, 0.9)
-			return result, nil
+	// Helper closures
+	boolPtr := func(b bool) *bool { return &b }
+	addCheck := func(name string, passed bool, detail string) {
+		rec.CheckResults = append(rec.CheckResults, models.CheckResult{
+			Check: name, Passed: passed, Detail: detail,
+		})
+		if !passed {
+			rec.FailureReasons = append(rec.FailureReasons, detail)
 		}
 	}
 
-	// Amount check: invoice should not exceed PO total
-	if invTotal > poTotal {
-		result.AmountMatch = false
-		result.DiscrepancyType = "AMOUNT_MISMATCH"
-		result.Discrepancies = append(result.Discrepancies, fmt.Sprintf("Invoice total %.2f exceeds PO total %.2f", invTotal, poTotal))
-		result.Summary = fmt.Sprintf("Amount mismatch: Invoice ₹%.2f > PO ₹%.2f", invTotal, poTotal)
+	// ── 1. Required fields ───────────────────────────────────────────────
+	requiredFields := []string{"vendor_name", "invoice_number", "po_reference", "total_amount", "invoice_date", "currency"}
+	allPresent := true
+	for _, f := range requiredFields {
+		v, ok := fields[f]
+		if !ok || v == nil || v == "" {
+			addCheck("required_field:"+f, false, fmt.Sprintf("missing required field: %s", f))
+			allPresent = false
+		}
+	}
+	if allPresent {
+		addCheck("required_fields", true, "all required fields present")
+	}
+
+	// ── 2. Total amount sanity ───────────────────────────────────────────
+	totalAmount, _ := toFloat(fields["total_amount"])
+	if totalAmount <= 0 {
+		addCheck("total_amount_positive", false, fmt.Sprintf("total_amount must be > 0, got %.2f", totalAmount))
 	} else {
-		result.AmountMatch = true
+		addCheck("total_amount_positive", true, fmt.Sprintf("total_amount ₹%.2f is valid", totalAmount))
 	}
 
-	// Simple line items check: same count or accept
-	result.LineItemsMatch = true
-	if result.Summary == "" {
-		result.Summary = "All checks passed — PO matched, amounts verified"
+	// ── 3. Date sanity ───────────────────────────────────────────────────
+	invDateStr, _ := fields["invoice_date"].(string)
+	dueDateStr, _ := fields["due_date"].(string)
+	if invDateStr != "" && dueDateStr != "" {
+		invDate, e1 := time.Parse("2006-01-02", invDateStr)
+		dueDate, e2 := time.Parse("2006-01-02", dueDateStr)
+		if e1 != nil || e2 != nil {
+			addCheck("date_format", false, "invalid invoice_date or due_date format (expected YYYY-MM-DD)")
+		} else if !dueDate.After(invDate) {
+			addCheck("date_order", false, "due_date must be after invoice_date")
+		} else {
+			addCheck("date_order", true, fmt.Sprintf("invoice_date %s → due_date %s", invDateStr, dueDateStr))
+		}
 	}
-	o.persistDiscrepancies(invoiceID, result.Discrepancies)
-	o.insertAuditLog(invoiceID, StepCrossReference, "completed", result.Summary, 1.0)
-	return result, nil
+
+	// ── 4. Vendor exists in vendors table ────────────────────────────────
+	var invVendorID string
+	_ = o.db.QueryRowContext(ctx, `SELECT vendor_id::text FROM invoices WHERE id = $1`, invoiceID).Scan(&invVendorID)
+	vendorName, _ := fields["vendor_name"].(string)
+	if invVendorID != "" {
+		var matchedName string
+		err := o.db.QueryRowContext(ctx,
+			`SELECT name FROM vendors WHERE id = $1`, invVendorID,
+		).Scan(&matchedName)
+		if err != nil {
+			rec.VendorValid = boolPtr(false)
+			addCheck("vendor_exists", false,
+				fmt.Sprintf("vendor_id %s not found in vendors table", invVendorID))
+		} else {
+			rec.VendorValid = boolPtr(true)
+			addCheck("vendor_exists", true,
+				fmt.Sprintf("vendor '%s' (id: %s) is a registered vendor", matchedName, invVendorID))
+			// Soft check: vendor name on invoice matches DB name
+			if vendorName != "" && !strings.EqualFold(strings.TrimSpace(vendorName), strings.TrimSpace(matchedName)) {
+				addCheck("vendor_name_match", false,
+					fmt.Sprintf("invoice vendor name '%s' does not match registered name '%s'", vendorName, matchedName))
+			} else {
+				addCheck("vendor_name_match", true,
+					fmt.Sprintf("vendor name '%s' matches", matchedName))
+			}
+		}
+	} else {
+		rec.VendorValid = boolPtr(false)
+		addCheck("vendor_exists", false, "could not resolve vendor_id from invoice")
+	}
+
+	// ── 5. PO exists and is open ─────────────────────────────────────────
+	poRef, _ := fields["po_reference"].(string)
+	var poID, poVendorID, poStatus string
+	var poTotal, poRemaining float64
+	var poLineItemsJSON []byte
+
+	poErr := o.db.QueryRowContext(ctx,
+		`SELECT id::text, vendor_id::text, total_value, remaining_value, line_items, status
+		   FROM purchase_orders WHERE po_number = $1`, poRef,
+	).Scan(&poID, &poVendorID, &poTotal, &poRemaining, &poLineItemsJSON, &poStatus)
+
+	if poErr != nil {
+		rec.POFound = boolPtr(false)
+		rec.POOpen = boolPtr(false)
+		addCheck("po_exists", false, fmt.Sprintf("purchase order '%s' not found", poRef))
+	} else {
+		rec.POFound = boolPtr(true)
+		poIDParsed, _ := uuid.Parse(poID)
+		rec.MatchedPONumber = &poRef
+		rec.MatchedPOID = &poIDParsed
+		addCheck("po_exists", true, fmt.Sprintf("PO '%s' found (status: %s, remaining: ₹%.2f)", poRef, poStatus, poRemaining))
+
+		// PO must be open
+		if poStatus == "CLOSED" {
+			rec.POOpen = boolPtr(false)
+			addCheck("po_open", false, fmt.Sprintf("PO '%s' is CLOSED — no further invoicing allowed", poRef))
+		} else {
+			rec.POOpen = boolPtr(true)
+			addCheck("po_open", true, fmt.Sprintf("PO '%s' is %s", poRef, poStatus))
+		}
+
+		// ── 6. Vendor on invoice must match PO vendor ────────────────────
+		if invVendorID != "" && poVendorID != "" {
+			if invVendorID == poVendorID {
+				rec.VendorMatchesPO = boolPtr(true)
+				addCheck("vendor_matches_po", true, "invoice vendor matches PO vendor")
+			} else {
+				rec.VendorMatchesPO = boolPtr(false)
+				addCheck("vendor_matches_po", false,
+					fmt.Sprintf("invoice vendor (%s) ≠ PO vendor (%s)", invVendorID, poVendorID))
+			}
+		}
+
+		// ── 7. Duplicate invoice number check ───────────────────────────
+		invNum, _ := fields["invoice_number"].(string)
+		if invNum != "" {
+			var dupCount int
+			_ = o.db.QueryRowContext(ctx,
+				`SELECT COUNT(*) FROM invoices WHERE invoice_number=$1 AND id!=$2 AND status NOT IN ('REJECTED')`,
+				invNum, invoiceID).Scan(&dupCount)
+			if dupCount > 0 {
+				rec.NoDuplicate = boolPtr(false)
+				addCheck("no_duplicate", false, fmt.Sprintf("invoice number '%s' already exists in the system", invNum))
+			} else {
+				rec.NoDuplicate = boolPtr(true)
+				addCheck("no_duplicate", true, fmt.Sprintf("invoice number '%s' is unique", invNum))
+			}
+		}
+
+		// ── 8. Invoice total vs PO remaining_value ───────────────────────
+		const amountTol = 0.02
+		if totalAmount > poRemaining*(1+amountTol) {
+			rec.AmountWithinPO = boolPtr(false)
+			addCheck("amount_within_po", false,
+				fmt.Sprintf("invoice total ₹%.2f exceeds PO remaining ₹%.2f", totalAmount, poRemaining))
+		} else {
+			rec.AmountWithinPO = boolPtr(true)
+			addCheck("amount_within_po", true,
+				fmt.Sprintf("invoice total ₹%.2f ≤ PO remaining ₹%.2f", totalAmount, poRemaining))
+		}
+
+		// ── 9. Per-line-item check: ordered items + prices ───────────────
+		var poItems []map[string]interface{}
+		if len(poLineItemsJSON) > 0 {
+			var raw []interface{}
+			if json.Unmarshal(poLineItemsJSON, &raw) == nil {
+				for _, e := range raw {
+					if m, ok := e.(map[string]interface{}); ok {
+						poItems = append(poItems, m)
+					}
+				}
+			}
+		}
+
+		invItems, hasItems := toLineItemSlice(fields["line_items"])
+		if !hasItems || len(invItems) == 0 {
+			addCheck("line_items_present", false, "invoice has no line items")
+			rec.ItemsMatch = boolPtr(false)
+			rec.PricesMatch = boolPtr(false)
+		} else {
+			addCheck("line_items_present", true, fmt.Sprintf("%d line item(s) on invoice", len(invItems)))
+
+			if len(poItems) == 0 {
+				// PO has no stored items — skip item-level check
+				rec.ItemsMatch = boolPtr(true)
+				rec.PricesMatch = boolPtr(true)
+				addCheck("items_match", true, "PO has no stored line items — item-level check skipped")
+			} else {
+				// Build PO lookup by normalised description
+				poByDesc := make(map[string]map[string]interface{}, len(poItems))
+				for _, pi := range poItems {
+					if d, _ := pi["description"].(string); d != "" {
+						poByDesc[normaliseDesc(d)] = pi
+					}
+				}
+
+				allItemsOK := true
+				allPricesOK := true
+				const priceTol = 0.02
+
+				for i, inv := range invItems {
+					idx := i + 1
+					invDesc, _ := inv["description"].(string)
+					key := normaliseDesc(invDesc)
+
+					poItem, found := poByDesc[key]
+					if !found {
+						for k, pi := range poByDesc {
+							if strings.Contains(k, key) || strings.Contains(key, k) {
+								poItem = pi
+								found = true
+								break
+							}
+						}
+					}
+
+					lir := models.LineItemResult{
+						Description: invDesc,
+						Matched:     found,
+					}
+					lir.InvQty, _ = toFloat(inv["quantity"])
+					lir.InvPrice, _ = toFloat(inv["unit_price"])
+
+					if !found {
+						allItemsOK = false
+						lir.Note = fmt.Sprintf("line_item[%d] '%s' not found in PO %s", idx, invDesc, poRef)
+						addCheck("item_match:"+invDesc, false, lir.Note)
+					} else {
+						lir.POQty, _ = toFloat(poItem["quantity"])
+						lir.POPrice, _ = toFloat(poItem["unit_price"])
+
+						// Quantity
+						qtyNote := ""
+						if lir.InvQty != lir.POQty {
+							qtyNote = fmt.Sprintf("qty %g ≠ PO qty %g; ", lir.InvQty, lir.POQty)
+							allItemsOK = false
+						}
+
+						// Price tolerance
+						priceNote := ""
+						if lir.POPrice > 0 {
+							diff := abs64(lir.InvPrice-lir.POPrice) / lir.POPrice
+							if diff > priceTol {
+								allPricesOK = false
+								lir.Matched = false
+								priceNote = fmt.Sprintf("price ₹%.2f ≠ PO ₹%.2f (%.1f%% variance)",
+									lir.InvPrice, lir.POPrice, diff*100)
+							}
+						}
+
+						if qtyNote != "" || priceNote != "" {
+							lir.Note = strings.TrimRight(qtyNote+priceNote, "; ")
+							addCheck("item_check:"+invDesc, false, lir.Note)
+						} else {
+							addCheck("item_check:"+invDesc, true,
+								fmt.Sprintf("'%s' qty=%g price=₹%.2f ✓", invDesc, lir.InvQty, lir.InvPrice))
+						}
+					}
+					rec.LineItemResults = append(rec.LineItemResults, lir)
+				}
+
+				rec.ItemsMatch = boolPtr(allItemsOK)
+				rec.PricesMatch = boolPtr(allPricesOK)
+				if allItemsOK {
+					addCheck("items_match", true, fmt.Sprintf("all %d ordered items found in PO", len(invItems)))
+				}
+				if allPricesOK {
+					addCheck("prices_match", true, "all item prices within 2% tolerance")
+				} else {
+					addCheck("prices_match", false, "one or more item prices deviate from PO by > 2%")
+				}
+			}
+		}
+	}
+
+	// ── Determine final status ───────────────────────────────────────────
+	hasFail := false
+	hasSoft := false
+	for _, c := range rec.CheckResults {
+		if !c.Passed {
+			// Soft flags: price drift or qty drift alone → FLAGGED (not FAILED)
+			if strings.HasPrefix(c.Check, "item_check:") || strings.HasPrefix(c.Check, "vendor_name_match") {
+				hasSoft = true
+			} else {
+				hasFail = true
+			}
+		}
+	}
+
+	finishedAt := time.Now()
+	rec.CompletedAt = &finishedAt
+
+	if hasFail {
+		rec.ValidationStatus = models.ValidationStatusFailed
+		rec.Summary = fmt.Sprintf("Validation FAILED — %d check(s) failed: %v",
+			len(rec.FailureReasons), rec.FailureReasons)
+	} else if hasSoft {
+		rec.ValidationStatus = models.ValidationStatusFlagged
+		rec.Summary = fmt.Sprintf("Validation FLAGGED — soft discrepancies detected: %v", rec.FailureReasons)
+	} else {
+		rec.ValidationStatus = models.ValidationStatusPassed
+		rec.FailureReasons = models.StringSlice{}
+		rec.Summary = fmt.Sprintf("Validation PASSED — %d checks all clear", len(rec.CheckResults))
+	}
+
+	// Persist final state
+	if err := o.upsertValidationRecord(rec); err != nil {
+		o.logger.Error("failed to persist validation record", zap.Error(err))
+	}
+
+	o.logger.Info("Validation complete",
+		zap.String("invoice_id", invoiceID.String()),
+		zap.String("status", string(rec.ValidationStatus)),
+		zap.Int("checks_run", len(rec.CheckResults)),
+		zap.Int("failures", len(rec.FailureReasons)),
+	)
+	return rec, nil
+}
+
+// upsertValidationRecord inserts or updates the invoice_validations row for
+// the given invoice. Uses INSERT … ON CONFLICT DO UPDATE so repeated calls
+// (RUNNING → PASSED/FAILED) are idempotent.
+func (o *Orchestrator) upsertValidationRecord(r *models.InvoiceValidation) error {
+	checksJSON, _ := json.Marshal(r.CheckResults)
+	lineJSON, _ := json.Marshal(r.LineItemResults)
+	failJSON, _ := json.Marshal(r.FailureReasons)
+
+	_, err := o.db.Exec(`
+		INSERT INTO invoice_validations
+		  (invoice_id, validation_status,
+		   vendor_valid, po_found, po_open, vendor_matches_po,
+		   items_match, prices_match, amount_within_po, no_duplicate,
+		   check_results, line_item_results,
+		   matched_po_number, matched_po_id,
+		   summary, failure_reasons, started_at, completed_at)
+		VALUES
+		  ($1,$2, $3,$4,$5,$6, $7,$8,$9,$10, $11::jsonb,$12::jsonb,
+		   $13,$14, $15,$16::jsonb,$17,$18)
+		ON CONFLICT (invoice_id) DO UPDATE SET
+		  validation_status  = EXCLUDED.validation_status,
+		  vendor_valid       = EXCLUDED.vendor_valid,
+		  po_found           = EXCLUDED.po_found,
+		  po_open            = EXCLUDED.po_open,
+		  vendor_matches_po  = EXCLUDED.vendor_matches_po,
+		  items_match        = EXCLUDED.items_match,
+		  prices_match       = EXCLUDED.prices_match,
+		  amount_within_po   = EXCLUDED.amount_within_po,
+		  no_duplicate       = EXCLUDED.no_duplicate,
+		  check_results      = EXCLUDED.check_results,
+		  line_item_results  = EXCLUDED.line_item_results,
+		  matched_po_number  = EXCLUDED.matched_po_number,
+		  matched_po_id      = EXCLUDED.matched_po_id,
+		  summary            = EXCLUDED.summary,
+		  failure_reasons    = EXCLUDED.failure_reasons,
+		  completed_at       = EXCLUDED.completed_at,
+		  updated_at         = NOW()
+	`,
+		r.InvoiceID, string(r.ValidationStatus),
+		r.VendorValid, r.POFound, r.POOpen, r.VendorMatchesPO,
+		r.ItemsMatch, r.PricesMatch, r.AmountWithinPO, r.NoDuplicate,
+		string(checksJSON), string(lineJSON),
+		r.MatchedPONumber, r.MatchedPOID,
+		r.Summary, string(failJSON), r.StartedAt, r.CompletedAt,
+	)
+	return err
+}
+
+// ── helpers ──────────────────────────────────────────────────────────────────
+
+func toFloat(v interface{}) (float64, bool) {
+	if v == nil {
+		return 0, false
+	}
+	switch n := v.(type) {
+	case float64:
+		return n, true
+	case float32:
+		return float64(n), true
+	case int:
+		return float64(n), true
+	case int64:
+		return float64(n), true
+	case json.Number:
+		f, err := n.Float64()
+		return f, err == nil
+	}
+	return 0, false
+}
+
+func abs64(x float64) float64 {
+	if x < 0 {
+		return -x
+	}
+	return x
+}
+
+// toLineItemSlice converts the raw line_items value (which may be
+// []interface{} after JSON unmarshalling or []map[string]interface{})
+// into a uniform []map[string]interface{}.
+func toLineItemSlice(raw interface{}) ([]map[string]interface{}, bool) {
+	switch v := raw.(type) {
+	case []map[string]interface{}:
+		return v, true
+	case []interface{}:
+		out := make([]map[string]interface{}, 0, len(v))
+		for _, elem := range v {
+			if m, ok := elem.(map[string]interface{}); ok {
+				out = append(out, m)
+			}
+		}
+		return out, len(out) == len(v)
+	}
+	return nil, false
+}
+
+// normaliseDesc returns a lower-case, trimmed description for comparison.
+func normaliseDesc(s string) string {
+	return strings.ToLower(strings.TrimSpace(s))
 }
 
 type Decision struct {
@@ -267,25 +618,32 @@ type Decision struct {
 	Reason string
 }
 
-func (o *Orchestrator) makeDecision(match *MatchResult) *Decision {
-	// Decision tree from the design doc
-	if !match.POFound {
-		return &Decision{Action: "REJECT", Reason: "Purchase order not found in system"}
+// makeDecision maps an InvoiceValidation record to an action.
+//
+//	FAILED  → hard failures (PO not found, closed, vendor mismatch,
+//	           duplicate, amount over PO) → REJECT
+//	FLAGGED → soft discrepancies (item/price drift) → FLAG for human review
+//	PASSED  → APPROVE
+func (o *Orchestrator) makeDecision(v *models.InvoiceValidation) *Decision {
+	switch v.ValidationStatus {
+	case models.ValidationStatusFailed:
+		return &Decision{Action: "REJECT", Reason: v.Summary}
+	case models.ValidationStatusFlagged:
+		return &Decision{Action: "FLAG", Reason: v.Summary}
+	default:
+		return &Decision{Action: "APPROVE", Reason: "All checks passed — auto-approved"}
 	}
+}
 
-	if match.DiscrepancyType == "DUPLICATE_INVOICE" {
-		return &Decision{Action: "REJECT", Reason: "Duplicate invoice detected"}
-	}
-
-	if !match.AmountMatch {
-		return &Decision{Action: "FLAG", Reason: fmt.Sprintf("Amount mismatch: %s", match.Discrepancies)}
-	}
-
-	if !match.LineItemsMatch {
-		return &Decision{Action: "FLAG", Reason: "Line items do not match purchase order"}
-	}
-
-	return &Decision{Action: "APPROVE", Reason: "All checks passed — auto-approved"}
+func (o *Orchestrator) draftQueryEmailFromValidation(ctx context.Context, invoiceID uuid.UUID, v *models.InvoiceValidation) error {
+	o.emitEvent(invoiceID, StepDraftQuery, "in_progress", "Drafting supplier query email...")
+	o.logger.Info("Drafting query email",
+		zap.String("invoice_id", invoiceID.String()),
+		zap.Strings("failure_reasons", v.FailureReasons),
+	)
+	o.emitEvent(invoiceID, StepDraftQuery, "completed", "Query email drafted and sent to supplier")
+	o.insertAuditLog(invoiceID, StepDraftQuery, "completed", "Query email drafted for discrepancies", 0.95)
+	return nil
 }
 
 func (o *Orchestrator) schedulePayment(ctx context.Context, invoiceID uuid.UUID, fields map[string]interface{}) error {
@@ -303,21 +661,39 @@ func (o *Orchestrator) schedulePayment(ctx context.Context, invoiceID uuid.UUID,
 		zap.String("invoice_id", invoiceID.String()),
 		zap.Time("payment_date", paymentDate),
 	)
+
+	// ── Decrement PO remaining_value and update PO status ────────────────
+	// This keeps the PO balance accurate for future invoices against the same PO.
+	poRef, _ := fields["po_reference"].(string)
+	invTotal, _ := toFloat(fields["total_amount"])
+	if poRef != "" && invTotal > 0 {
+		_, poErr := o.db.Exec(`
+			UPDATE purchase_orders
+			   SET remaining_value = GREATEST(0, remaining_value - $1),
+			       status = CASE
+			                  WHEN GREATEST(0, remaining_value - $1) = 0 THEN 'CLOSED'
+			                  WHEN remaining_value - $1 < total_value   THEN 'PARTIALLY_MATCHED'
+			                  ELSE status
+			                END,
+			       updated_at = NOW()
+			 WHERE po_number = $2`, invTotal, poRef)
+		if poErr != nil {
+			o.logger.Warn("Failed to decrement PO remaining_value",
+				zap.String("po_reference", poRef),
+				zap.Error(poErr),
+			)
+		} else {
+			o.logger.Info("PO remaining value decremented",
+				zap.String("po_reference", poRef),
+				zap.Float64("invoice_total", invTotal),
+			)
+		}
+	}
+
 	o.emitEvent(invoiceID, StepSchedule, "completed",
 		fmt.Sprintf("Payment scheduled for %s", paymentDate.Format("2006-01-02")))
 	o.insertAuditLog(invoiceID, StepSchedule, "completed",
 		fmt.Sprintf("Payment scheduled for %s (terms: %d days)", paymentDate.Format("2006-01-02"), paymentTermsDays), 1.0)
-	return nil
-}
-
-func (o *Orchestrator) draftQueryEmail(ctx context.Context, invoiceID uuid.UUID, match *MatchResult) error {
-	o.emitEvent(invoiceID, StepDraftQuery, "in_progress", "Drafting supplier query email...")
-	o.logger.Info("Drafting query email",
-		zap.String("invoice_id", invoiceID.String()),
-		zap.Strings("discrepancies", match.Discrepancies),
-	)
-	o.emitEvent(invoiceID, StepDraftQuery, "completed", "Query email drafted and sent to supplier")
-	o.insertAuditLog(invoiceID, StepDraftQuery, "completed", "Query email drafted for discrepancies", 0.95)
 	return nil
 }
 
@@ -415,12 +791,4 @@ func (o *Orchestrator) persistExtractedFields(invoiceID uuid.UUID, fields map[st
 	if err != nil {
 		o.logger.Error("Failed to persist extracted fields", zap.Error(err), zap.String("invoice_id", invoiceID.String()))
 	}
-}
-
-func (o *Orchestrator) persistDiscrepancies(invoiceID uuid.UUID, discrepancies []string) {
-	if len(discrepancies) == 0 {
-		return
-	}
-	b, _ := json.Marshal(discrepancies)
-	_, _ = o.db.Exec(`UPDATE invoices SET discrepancies = $1::jsonb WHERE id = $2`, string(b), invoiceID)
 }

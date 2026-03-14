@@ -64,8 +64,8 @@ func main() {
 	defer broadcaster.Stop()
 	logger.Info("Agent orchestrator and event broadcaster started")
 
-	// Start payment scheduler (cron)
-	cron := scheduler.NewPaymentScheduler(db, cfg, logger)
+	// Start payment scheduler (cron) + invoice poll loop
+	cron := scheduler.NewPaymentScheduler(db, cfg, logger, orch)
 	cron.Start()
 	defer cron.Stop()
 	logger.Info("Payment scheduler started")
@@ -83,4 +83,3 @@ func main() {
 		logger.Fatal("Failed to start server", zap.Error(err))
 	}
 }
-
