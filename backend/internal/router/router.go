@@ -13,7 +13,7 @@ import (
 	"go.uber.org/zap"
 )
 
-func Setup(db *sqlx.DB, cfg *config.Config, logger *zap.Logger, orch *agent.Orchestrator, broadcaster *events.Broadcaster, storage services.StorageService) *gin.Engine {
+func Setup(db *sqlx.DB, cfg *config.Config, logger *zap.Logger, orch *agent.Orchestrator, broadcaster *events.Broadcaster, storage services.StorageService, llm services.LLMService) *gin.Engine {
 	if cfg.AppEnv == "production" {
 		gin.SetMode(gin.ReleaseMode)
 	}
@@ -34,7 +34,7 @@ func Setup(db *sqlx.DB, cfg *config.Config, logger *zap.Logger, orch *agent.Orch
 	})
 
 	// Initialize handlers
-	invoiceHandler := handlers.NewInvoiceHandler(db, cfg, logger, orch, storage)
+	invoiceHandler := handlers.NewInvoiceHandler(db, cfg, logger, orch, storage, llm)
 	vendorHandler := handlers.NewVendorHandler(db, logger)
 	poHandler := handlers.NewPurchaseOrderHandler(db, logger)
 	paymentHandler := handlers.NewPaymentHandler(db, cfg, logger)
@@ -58,6 +58,7 @@ func Setup(db *sqlx.DB, cfg *config.Config, logger *zap.Logger, orch *agent.Orch
 			invoices := protected.Group("/invoices")
 			{
 				invoices.POST("/upload", invoiceHandler.Upload)
+				invoices.POST("/upload-sync", invoiceHandler.UploadSync) // New: synchronous extract + validate + store
 				invoices.POST("/upload-json", invoiceHandler.UploadJSON)
 				invoices.GET("", invoiceHandler.List)
 				invoices.GET("/:id", invoiceHandler.GetByID)

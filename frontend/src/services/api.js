@@ -45,7 +45,7 @@ export const getInvoiceAuditLog = (id) =>
   api.get(`/invoices/${id}/audit-log`)
 
 export const uploadInvoice = (formData) =>
-  api.post('/invoices/upload', formData, {
+  api.post('/invoices/upload-sync', formData, {
     headers: { 'Content-Type': 'multipart/form-data' },
   })
 

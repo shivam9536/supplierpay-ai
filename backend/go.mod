@@ -5,6 +5,10 @@ go 1.24
 toolchain go1.24.5
 
 require (
+	github.com/aws/aws-sdk-go-v2 v1.21.0
+	github.com/aws/aws-sdk-go-v2/config v1.18.42
+	github.com/aws/aws-sdk-go-v2/service/bedrockruntime v1.1.0
+	github.com/aws/aws-sdk-go-v2/service/s3 v1.40.0
 	github.com/gin-contrib/cors v1.7.2
 	github.com/gin-gonic/gin v1.9.1
 	github.com/golang-jwt/jwt/v5 v5.2.1
@@ -62,10 +66,3 @@ require (
 	google.golang.org/protobuf v1.34.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
-
-// AWS SDK — add back when implementing real Bedrock/S3/SES clients:
-// go get github.com/aws/aws-sdk-go-v2@latest
-// go get github.com/aws/aws-sdk-go-v2/config@latest
-// go get github.com/aws/aws-sdk-go-v2/service/bedrockruntime@latest
-// go get github.com/aws/aws-sdk-go-v2/service/s3@latest
-// go get github.com/aws/aws-sdk-go-v2/service/sesv2@latest

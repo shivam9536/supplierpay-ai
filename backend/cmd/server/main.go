@@ -73,7 +73,7 @@ func main() {
 	logger.Info("Payment scheduler started")
 
 	// Setup and start HTTP server
-	r := router.Setup(db, cfg, logger, orch, broadcaster, storage)
+	r := router.Setup(db, cfg, logger, orch, broadcaster, storage, llm)
 
 	port := cfg.AppPort
 	if port == "" {

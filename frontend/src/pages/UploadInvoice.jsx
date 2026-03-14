@@ -1,113 +1,141 @@
-import { useState } from 'react'
-import { Upload, FileText, Loader2 } from 'lucide-react'
+import { useState, useRef } from 'react'
+import { Upload, FileText, Loader2, CheckCircle, XCircle } from 'lucide-react'
+import { uploadInvoice } from '../services/api'
 
 export default function UploadInvoice() {
-  const [file, setFile] = useState(null)
   const [uploading, setUploading] = useState(false)
   const [result, setResult] = useState(null)
   const [dragOver, setDragOver] = useState(false)
+  const fileInputRef = useRef(null)
 
   const handleDrop = (e) => {
     e.preventDefault()
     setDragOver(false)
     const dropped = e.dataTransfer.files[0]
-    if (dropped) setFile(dropped)
+    if (dropped && dropped.type === 'application/pdf') {
+      handleFileUpload(dropped)
+    }
   }
 
-  const handleUpload = async () => {
-    if (!file) return
-    setUploading(true)
+  const handleFileSelect = (e) => {
+    const file = e.target.files[0]
+    if (file) {
+      handleFileUpload(file)
+    }
+  }
 
-    // TODO: Dev 4 — Call uploadInvoice() API with FormData
-    // Then subscribe to SSE for real-time pipeline updates
-    setTimeout(() => {
+  const handleFileUpload = async (file) => {
+    setUploading(true)
+    setResult(null)
+
+    try {
+      const formData = new FormData()
+      formData.append('invoice', file)
+
+      const response = await uploadInvoice(formData)
+
+      if (response.data.success) {
+        setResult({
+          success: true,
+          message: response.data.message || 'Invoice uploaded and processed successfully',
+          invoice_id: response.data.data?.invoice_id,
+          po_reference: response.data.data?.po_reference,
+          invoice_number: response.data.data?.invoice_number,
+          total_amount: response.data.data?.total_amount,
+          currency: response.data.data?.currency,
+        })
+      } else {
+        setResult({
+          success: false,
+          message: response.data.error || 'Upload failed',
+        })
+      }
+    } catch (error) {
+      const errorMessage = error.response?.data?.error || error.message || 'Upload failed'
       setResult({
-        invoice_id: 'new-invoice-id',
-        status: 'PENDING',
-        message: 'Invoice uploaded and processing started',
+        success: false,
+        message: errorMessage,
       })
+    } finally {
       setUploading(false)
-    }, 1500)
+      if (fileInputRef.current) {
+        fileInputRef.current.value = ''
+      }
+    }
   }
 
   return (
     <div>
       <div className="mb-8">
         <h1 className="text-2xl font-bold text-gray-900">Upload Invoice</h1>
-        <p className="text-gray-500 mt-1">Upload a PDF invoice or paste JSON payload</p>
+        <p className="text-gray-500 mt-1">Upload a PDF invoice for automatic processing</p>
       </div>
 
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
-        {/* PDF Upload */}
-        <div className="bg-white rounded-xl border border-gray-200 shadow-sm p-6">
-          <h2 className="text-lg font-semibold text-gray-900 mb-4">PDF Upload</h2>
+      <div className="max-w-xl mx-auto">
+        <div className="bg-white rounded-xl border border-gray-200 shadow-sm p-8">
           <div
             onDragOver={(e) => { e.preventDefault(); setDragOver(true) }}
             onDragLeave={() => setDragOver(false)}
             onDrop={handleDrop}
             className={`border-2 border-dashed rounded-xl p-12 text-center transition-colors ${
               dragOver ? 'border-primary-400 bg-primary-50' : 'border-gray-300 hover:border-gray-400'
-            }`}
+            } ${uploading ? 'pointer-events-none opacity-50' : ''}`}
           >
-            <Upload className="w-12 h-12 text-gray-400 mx-auto mb-4" />
-            <p className="text-gray-600 mb-2">Drag & drop your invoice PDF here</p>
-            <p className="text-sm text-gray-400 mb-4">or</p>
-            <label className="px-4 py-2 bg-primary-600 text-white rounded-lg text-sm font-medium cursor-pointer hover:bg-primary-700 transition-colors">
-              Browse Files
-              <input
-                type="file"
-                accept=".pdf"
-                className="hidden"
-                onChange={(e) => setFile(e.target.files[0])}
-              />
-            </label>
+            {uploading ? (
+              <>
+                <Loader2 className="w-12 h-12 text-primary-600 mx-auto mb-4 animate-spin" />
+                <p className="text-gray-600 mb-2">Processing invoice...</p>
+                <p className="text-sm text-gray-400">Extracting data and validating</p>
+              </>
+            ) : (
+              <>
+                <Upload className="w-12 h-12 text-gray-400 mx-auto mb-4" />
+                <p className="text-gray-600 mb-2">Drag & drop your invoice PDF here</p>
+                <p className="text-sm text-gray-400 mb-4">or</p>
+                <label className="px-6 py-3 bg-primary-600 text-white rounded-lg text-sm font-medium cursor-pointer hover:bg-primary-700 transition-colors inline-block">
+                  Upload Invoice
+                  <input
+                    ref={fileInputRef}
+                    type="file"
+                    accept=".pdf"
+                    className="hidden"
+                    onChange={handleFileSelect}
+                  />
+                </label>
+              </>
+            )}
           </div>
 
-          {file && (
-            <div className="mt-4 p-4 bg-gray-50 rounded-lg flex items-center justify-between">
-              <div className="flex items-center gap-3">
-                <FileText className="w-5 h-5 text-primary-600" />
+          {result && (
+            <div className={`mt-6 p-4 rounded-lg border ${
+              result.success
+                ? 'bg-green-50 border-green-200'
+                : 'bg-red-50 border-red-200'
+            }`}>
+              <div className="flex items-start gap-3">
+                {result.success ? (
+                  <CheckCircle className="w-5 h-5 text-green-600 mt-0.5" />
+                ) : (
+                  <XCircle className="w-5 h-5 text-red-600 mt-0.5" />
+                )}
                 <div>
-                  <p className="text-sm font-medium text-gray-900">{file.name}</p>
-                  <p className="text-xs text-gray-500">{(file.size / 1024).toFixed(1)} KB</p>
+                  <p className={`text-sm font-medium ${
+                    result.success ? 'text-green-800' : 'text-red-800'
+                  }`}>
+                    {result.message}
+                  </p>
+                  {result.success && result.invoice_id && (
+                    <div className="text-xs text-green-600 mt-2 space-y-1">
+                      <p>Invoice ID: {result.invoice_id}</p>
+                      {result.po_reference && <p>PO Reference: {result.po_reference}</p>}
+                      {result.invoice_number && <p>Invoice #: {result.invoice_number}</p>}
+                      {result.total_amount && <p>Amount: {result.currency || 'INR'} {result.total_amount.toLocaleString()}</p>}
+                    </div>
+                  )}
                 </div>
               </div>
-              <button
-                onClick={handleUpload}
-                disabled={uploading}
-                className="px-4 py-2 bg-primary-600 text-white rounded-lg text-sm font-medium hover:bg-primary-700 disabled:opacity-50 flex items-center gap-2 transition-colors"
-              >
-                {uploading && <Loader2 className="w-4 h-4 animate-spin" />}
-                {uploading ? 'Processing...' : 'Upload & Process'}
-              </button>
             </div>
           )}
-
-          {result && (
-            <div className="mt-4 p-4 bg-green-50 border border-green-200 rounded-lg">
-              <p className="text-sm font-medium text-green-800">{result.message}</p>
-              <p className="text-xs text-green-600 mt-1">Invoice ID: {result.invoice_id}</p>
-            </div>
-          )}
-        </div>
-
-        {/* JSON Upload (Hackathon Demo) */}
-        <div className="bg-white rounded-xl border border-gray-200 shadow-sm p-6">
-          <h2 className="text-lg font-semibold text-gray-900 mb-4">JSON Payload (Demo)</h2>
-          <textarea
-            className="w-full h-64 p-4 border border-gray-300 rounded-lg font-mono text-sm focus:ring-2 focus:ring-primary-500 focus:border-transparent outline-none resize-none"
-            placeholder={`{
-  "vendor_name": "Acme Corp",
-  "invoice_number": "INV-2026-050",
-  "po_reference": "PO-2026-100",
-  "total_amount": 50000,
-  "tax_amount": 9000,
-  "line_items": [...]
-}`}
-          />
-          <button className="mt-4 w-full py-2.5 bg-gray-800 text-white rounded-lg text-sm font-medium hover:bg-gray-900 transition-colors">
-            Submit JSON Invoice
-          </button>
         </div>
       </div>
     </div>

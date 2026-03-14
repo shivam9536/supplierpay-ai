@@ -83,8 +83,8 @@ func (h *PurchaseOrderHandler) Create(c *gin.Context) {
 	}
 	po.ID = uuid.New()
 	lineItemsJSON := "[]"
-	if po.LineItems != nil {
-		b, _ := json.Marshal(po.LineItems)
+	if po.LineItems.Data != nil {
+		b, _ := json.Marshal(po.LineItems.Data)
 		lineItemsJSON = string(b)
 	}
 	_, err := h.db.Exec(`INSERT INTO purchase_orders (id, po_number, vendor_id, total_value, remaining_value, line_items, approved_by, status)
