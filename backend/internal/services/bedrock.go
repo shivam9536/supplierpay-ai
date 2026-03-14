@@ -343,7 +343,7 @@ Analyze for:
 
 Return ONLY this JSON:
 {
-  "overall_assessment": "PASS" | "FLAG" | "REJECT",
+  "overall_assessment": "APPROVE" | "FLAG" | "REJECT",
   "confidence": number (0-1),
   "additional_discrepancies": ["string", ...],
   "semantic_matches": [{"invoice_desc": "string", "po_desc": "string", "match": true|false, "note": "string"}],

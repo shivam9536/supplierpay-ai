@@ -68,6 +68,35 @@ CREATE TABLE IF NOT EXISTS invoices (
     updated_at                TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
+-- ── Invoice Validations ─────────────────────
+CREATE TABLE IF NOT EXISTS invoice_validations (
+    id                  UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    invoice_id          UUID NOT NULL UNIQUE REFERENCES invoices(id) ON DELETE CASCADE,
+    validation_status   VARCHAR(20) NOT NULL DEFAULT 'PENDING'
+                        CHECK (validation_status IN ('PENDING','RUNNING','PASSED','FAILED','FLAGGED')),
+    vendor_valid        BOOLEAN,
+    po_found            BOOLEAN,
+    po_open             BOOLEAN,
+    vendor_matches_po   BOOLEAN,
+    items_match         BOOLEAN,
+    prices_match        BOOLEAN,
+    amount_within_po    BOOLEAN,
+    no_duplicate        BOOLEAN,
+    check_results       JSONB DEFAULT '[]',
+    line_item_results   JSONB DEFAULT '[]',
+    matched_po_number   VARCHAR(50),
+    matched_po_id       UUID,
+    summary             TEXT DEFAULT '',
+    failure_reasons     JSONB DEFAULT '[]',
+    started_at          TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    completed_at        TIMESTAMP WITH TIME ZONE,
+    created_at          TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    updated_at          TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_invoice_validations_invoice ON invoice_validations(invoice_id);
+CREATE INDEX IF NOT EXISTS idx_invoice_validations_status ON invoice_validations(validation_status);
+
 -- ── Audit Log ───────────────────────────────
 CREATE TABLE IF NOT EXISTS audit_logs (
     id                UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -138,4 +167,8 @@ CREATE TRIGGER trigger_invoices_updated_at
 
 CREATE TRIGGER trigger_payment_runs_updated_at
     BEFORE UPDATE ON payment_runs
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at();
+
+CREATE TRIGGER trigger_invoice_validations_updated_at
+    BEFORE UPDATE ON invoice_validations
     FOR EACH ROW EXECUTE FUNCTION update_updated_at();

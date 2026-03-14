@@ -117,11 +117,15 @@ func (o *Orchestrator) ProcessInvoice(ctx context.Context, invoiceID uuid.UUID) 
 func (o *Orchestrator) extract(ctx context.Context, invoiceID uuid.UUID) (map[string]interface{}, error) {
 	o.logger.Info("Extracting invoice fields", zap.String("invoice_id", invoiceID.String()))
 
-	var rawURL string
+	var rawURLPtr *string
 	var extractedJSON []byte
-	err := o.db.QueryRow(`SELECT raw_file_url, extracted_fields FROM invoices WHERE id = $1`, invoiceID).Scan(&rawURL, &extractedJSON)
+	err := o.db.QueryRow(`SELECT raw_file_url, extracted_fields FROM invoices WHERE id = $1`, invoiceID).Scan(&rawURLPtr, &extractedJSON)
 	if err != nil {
 		return nil, fmt.Errorf("invoice not found: %w", err)
+	}
+	rawURL := ""
+	if rawURLPtr != nil {
+		rawURL = *rawURLPtr
 	}
 
 	var extractedFields map[string]interface{}
@@ -473,8 +477,10 @@ func (o *Orchestrator) runValidation(
 	hasSoft := false
 	for _, c := range rec.CheckResults {
 		if !c.Passed {
-			// Soft flags: price drift or qty drift alone → FLAGGED (not FAILED)
-			if strings.HasPrefix(c.Check, "item_check:") || strings.HasPrefix(c.Check, "vendor_name_match") {
+			// Soft flags: price/qty drift or vendor name mismatch → FLAGGED (not FAILED)
+			if strings.HasPrefix(c.Check, "item_check:") ||
+				strings.HasPrefix(c.Check, "vendor_name_match") ||
+				c.Check == "prices_match" {
 				hasSoft = true
 			} else {
 				hasFail = true
@@ -511,10 +517,15 @@ func (o *Orchestrator) runValidation(
 			addCheck("llm_risk_flag", false, "LLM risk: "+flag)
 			hasSoft = true
 		}
-		// If LLM says REJECT, escalate to hard fail
-		if llmResult.OverallAssessment == "REJECT" && !hasFail {
-			hasFail = true
-			rec.FailureReasons = append(rec.FailureReasons, "LLM audit: "+llmResult.Explanation)
+		// Escalate based on LLM assessment
+		switch llmResult.OverallAssessment {
+		case "REJECT":
+			if !hasFail {
+				hasFail = true
+				rec.FailureReasons = append(rec.FailureReasons, "LLM audit: "+llmResult.Explanation)
+			}
+		case "FLAG":
+			hasSoft = true
 		}
 		// Store LLM explanation in check results
 		addCheck("llm_audit", llmResult.OverallAssessment != "REJECT",

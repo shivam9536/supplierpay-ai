@@ -8,7 +8,7 @@
   "currency": "INR",
   "line_items": [
     {
-      "description": "Cloud Hosting - March",
+      "description": "Cloud Hosting - Monthly",
       "quantity": 1,
       "unit_price": 41000.00,
       "total": 41000.00
@@ -23,7 +23,7 @@
   "subtotal": 50000.00,
   "tax_rate": 18,
   "tax_amount": 9000.00,
-  "total_amount": 59000.00,
+  "total_amount": 50000.00,
   "payment_terms": "Net 30",
   "bank_details": {
     "account_name": "Acme Cloud Solutions Pvt Ltd",
